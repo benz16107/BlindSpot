@@ -29,7 +29,7 @@ class NavigationTool:
         
         self.session = NavigationSession()
 
-    # @llm.function_tool(description="Start turn-by-turn navigation to a destination")
+    @llm.function_tool(description="Start turn-by-turn navigation from an origin to a destination. Use this when the user wants to be guided step-by-step (e.g. 'navigate me to X', 'guide me to Y').")
     async def start_navigation(self, origin: str, destination: str, mode: str = "walking") -> str:
         if not self.client:
             return "Google Maps API key not configured."
@@ -107,7 +107,7 @@ class NavigationTool:
             logger.error(f"Error starting navigation: {e}")
             return f"Error starting navigation: {str(e)}"
 
-    # @llm.function_tool(description="Update user location (latitude, longitude) for navigation tracking")
+    @llm.function_tool(description="Update user location (latitude, longitude) for navigation tracking. Call when you receive the user's current GPS coordinates to get the next turn instruction.")
     async def update_location(self, lat: float, lng: float) -> str:
         """
         Updates the user's location. If a turn is approaching, returns the instruction.

@@ -12,6 +12,7 @@ from livekit.plugins import (
 # from mcp_client import MCPServerSse
 from mcp_client import MCPServerHttp, MCPToolsIntegration   # or MCPServerStreamableHttp
 from backboard_store import init_backboard
+from google_maps import NavigationTool
 import os
 import logging
 
@@ -94,6 +95,17 @@ async def my_agent(ctx: agents.JobContext):
         agent_kwargs={"instructions": full_instructions},
         memory_manager=memory_manager  # Pass memory manager to tools
     )
+
+    # Register Google Maps navigation tools so the agent can provide directions
+    nav_tool = NavigationTool()
+    if hasattr(agent, "_tools") and isinstance(agent._tools, list):
+        agent._tools.extend([
+            nav_tool.start_navigation,
+            nav_tool.update_location,
+            nav_tool.get_walking_directions,
+            nav_tool.search_places,
+        ])
+        logger.info("Registered Google Maps navigation tools with agent")
 
     await session.start(
         room=ctx.room,
