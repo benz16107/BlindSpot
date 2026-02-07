@@ -2,6 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>We use your location to provide walking navigation assistance.</string>
+
 	<key>NSCameraUsageDescription</key>
 	<string>This app needs camera access to show the camera feed.</string>
 	<key>CFBundleDevelopmentRegion</key>
