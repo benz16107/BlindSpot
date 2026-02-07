@@ -22,16 +22,18 @@ logger = logging.getLogger("backboard")
 class BackboardMemoryManager:
     """Manages persistent memory via Backboard API"""
 
-    def __init__(self, api_key: str, memory_file: str = ".backboard.json"):
+    def __init__(self, api_key: str, memory_file: Optional[str] = None):
         """
         Initialize memory manager
-        
+
         Args:
             api_key: Backboard API key
-            memory_file: Path to local metadata file
+            memory_file: Path to local metadata file (default: .backboard.json next to this module)
         """
         self.client = BackboardClient(api_key=api_key)
-        self.memory_file = memory_file
+        self.memory_file = memory_file or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), ".backboard.json"
+        )
         self.assistant_id: Optional[str] = None
         self.thread_id: Optional[str] = None
         self.conversation_history = self._load_memory()

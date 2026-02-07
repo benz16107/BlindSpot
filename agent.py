@@ -1,8 +1,8 @@
-      
+import asyncio
 from dotenv import load_dotenv
 
 from livekit import agents, rtc
-from livekit.agents import AgentServer, AgentSession, Agent, room_io
+from livekit.agents import AgentServer, AgentSession, Agent, room_io, ConversationItemAddedEvent
 from livekit.plugins import (
     google,
     # openai,  # Commented out - using Google Gemini instead
@@ -63,6 +63,25 @@ async def my_agent(ctx: agents.JobContext):
         # PTT Configuration: Helper can be interrupted (mutes when user speaks/presses button)
         allow_interruptions=True,
     )
+
+    # Persist each user/assistant turn to Backboard so memory survives restarts
+    if memory_manager:
+
+        def on_conversation_item_added(event: ConversationItemAddedEvent):
+            text = (event.item.text_content or "").strip()
+            if not text:
+                return
+            role = (event.item.role or "").lower()
+            try:
+                loop = asyncio.get_running_loop()
+                if role == "user":
+                    loop.create_task(memory_manager.add_user_message(text))
+                elif role == "assistant":
+                    loop.create_task(memory_manager.add_assistant_message(text))
+            except RuntimeError:
+                pass  # No running loop (e.g. during shutdown)
+
+        session.on("conversation_item_added", on_conversation_item_added)
     
     # # Commented out: OpenAI Realtime Model (replaced with Google Gemini)
     # session = AgentSession(
