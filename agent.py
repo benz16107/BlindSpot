@@ -22,27 +22,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agent")
 
 class Assistant(Agent):
-    def __init__(self, instructions: str = None, **kwargs) -> None:
-        fnc_ctx = kwargs.pop("fnc_ctx", None)
+    def __init__(self, instructions: str = None) -> None:
         default_instructions = instructions or "You are a helpful voice AI assistant. You can use the tools provided to you to help the user (Zapier MCP Server)"
-        super().__init__(instructions=default_instructions, **kwargs)
-        
-        # Initialize tools list (mcp_client looks for this)
-        if not hasattr(self, '_tools'):
-            self._tools = []
-            
-        # Register NavigationTool methods if context provided
-        if fnc_ctx:
-            # Manually register the decorated tool methods
-            # Note: The methods are already decorated with @llm.function_tool
-            local_tools = [
-                # fnc_ctx.start_navigation, # Disabled for now
-                # fnc_ctx.update_location,  # Disabled for now
-                fnc_ctx.get_walking_directions,
-                fnc_ctx.search_places
-            ]
-            self._tools.extend(local_tools)
-            logger.info(f"Registered local navigation tools: {[t.__name__ for t in local_tools]}")
+        super().__init__(instructions=default_instructions)
 
 server = AgentServer()
 
@@ -65,7 +47,7 @@ async def my_agent(ctx: agents.JobContext):
         logger.debug(f"Loaded context: {len(thread_history)} messages, {len(context_text)} chars")
     
     # 3. Create session with injected context
-    base_instructions = "You are a helpful voice AI assistant. You can use the tools provided to you to help the user (Zapier MCP Server)"
+    base_instructions = "You are a helpful voice AI assistant soley for the purpose of navigation for blind people.. You can use the tools provided to you to help the user (Zapier MCP Server)"
     
     if context_text:
         full_instructions = f"{base_instructions}\n\n{context_text}"
@@ -76,7 +58,9 @@ async def my_agent(ctx: agents.JobContext):
     session = AgentSession(
         llm=google.realtime.RealtimeModel(
             voice="Aoede", # Other options Puck (default), Kore (Femme), Charon, Fenrir, Aoede,
-        )
+        ),
+        # PTT Configuration: Helper can be interrupted (mutes when user speaks/presses button)
+        allow_interruptions=True,
     )
     
     # # Commented out: OpenAI Realtime Model (replaced with Google Gemini)
@@ -104,17 +88,10 @@ async def my_agent(ctx: agents.JobContext):
         name="Zapier MCP Server"
     )
 
-    # Initialize Navigation tool
-    from google_maps import NavigationTool
-    nav_tool = NavigationTool()
-
     agent = await MCPToolsIntegration.create_agent_with_tools(
         agent_class=Assistant,
         mcp_servers=[mcp_server],
-        agent_kwargs={
-            "instructions": full_instructions + "\n\nYou also have access to Google Maps tools for searching places and getting static directions. Note: Turn-by-turn navigation is currently disabled.",
-            "fnc_ctx": nav_tool,
-        },
+        agent_kwargs={"instructions": full_instructions},
         memory_manager=memory_manager  # Pass memory manager to tools
     )
 
