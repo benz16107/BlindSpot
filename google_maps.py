@@ -1,6 +1,7 @@
 import asyncio
 import os
 import googlemaps
+import requests
 from livekit.agents import llm
 import logging
 from navigation import NavigationSession
@@ -169,29 +170,44 @@ class NavigationTool:
 
     @llm.function_tool(description="Search for a place or point of interest")
     async def search_places(self, query: str) -> str:
-        if not self.client:
+        api_key = os.environ.get("GOOGLE_MAPS_API_KEY")
+        if not api_key:
             return "Google Maps API key not configured."
-            
+
+        url = "https://places.googleapis.com/v1/places:searchText"
+        headers = {
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": api_key,
+            "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.rating",
+        }
+        payload = {"textQuery": query, "pageSize": 3}
+
         try:
-            places_result = await asyncio.to_thread(self.client.places, query)
-            
-            if not places_result or 'results' not in places_result:
+            def _search():
+                resp = requests.post(url, json=payload, headers=headers, timeout=10)
+                resp.raise_for_status()
+                return resp.json()
+
+            data = await asyncio.to_thread(_search)
+            places = data.get("places") or []
+            if not places:
                 return "No places found."
-            
-            results = places_result['results']
-            if not results:
-                return "No places found."
-            
-            # Return top 3 results
-            response_text = f"Found {len(results)} places (showing top 3):\n"
-            for place in results[:3]:
-                name = place.get('name', 'Unknown')
-                address = place.get('formatted_address', 'Unknown address')
-                rating = place.get('rating', 'N/A')
+
+            response_text = f"Found {len(places)} places (showing top 3):\n"
+            for place in places[:3]:
+                name = "Unknown"
+                if place.get("displayName") and isinstance(place["displayName"].get("text"), str):
+                    name = place["displayName"]["text"]
+                address = place.get("formattedAddress") or "Unknown address"
+                rating = place.get("rating", "N/A")
+                if isinstance(rating, (int, float)):
+                    rating = str(rating)
                 response_text += f"- {name}: {address} (Rating: {rating})\n"
-                
             return response_text
-            
+
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"Error searching places: {e.response.text if e.response else e}")
+            return f"Error searching places: {str(e)}"
         except Exception as e:
             logger.error(f"Error searching places: {e}")
             return f"Error searching places: {str(e)}"
