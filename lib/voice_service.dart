@@ -14,6 +14,7 @@ class VoiceService extends ChangeNotifier {
   Timer? _gpsTimer;
   double? _lat;
   double? _lng;
+  double? _heading; // compass heading 0-360 (0 = north), for agent
   EventsListener<RoomEvent>? _roomListener;
 
   static const String _gpsTopic = 'gps';
@@ -25,16 +26,23 @@ class VoiceService extends ChangeNotifier {
   bool get audioPlaybackFailed => _audioPlaybackFailed;
   bool _audioPlaybackFailed = false;
 
-  /// Call whenever position updates so we can publish when connected.
-  void updateGps(double lat, double lng) {
+  /// Call whenever position or compass heading updates so we can publish when connected.
+  void updateGps(double lat, double lng, [double? heading]) {
     _lat = lat;
     _lng = lng;
+    if (heading != null) _heading = heading;
   }
+
+  bool _disconnecting = false;
 
   /// Connect to the voice agent (publish mic; start sending GPS). Memory from previous sessions is preserved on the server.
   /// [tokenUrlOverride] Use this on a physical device to point to your computer's IP (e.g. http://192.168.1.100:8765/token).
+  /// Uses a unique identity per connection so turning mic off and on again starts a fresh agent session.
   Future<void> connect({String? tokenUrlOverride}) async {
     if (_room != null) return;
+    while (_disconnecting) {
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
 
     final tokenServerUrl = (tokenUrlOverride ?? tokenUrl).trim();
     if (tokenServerUrl.isEmpty) {
@@ -42,7 +50,12 @@ class VoiceService extends ChangeNotifier {
     }
 
     try {
-      final uri = Uri.parse(tokenServerUrl);
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final identity = 'mobile-user-$now';
+      final roomName = 'voice-nav-$now';
+      final uri = Uri.parse(tokenServerUrl).replace(
+        queryParameters: {'identity': identity, 'room': roomName},
+      );
       final resp = await http.get(uri);
       if (resp.statusCode != 200) {
         throw Exception('Token failed: ${resp.statusCode} ${resp.body}');
@@ -56,6 +69,7 @@ class VoiceService extends ChangeNotifier {
 
       final room = Room();
       _setUpRoomListeners(room);
+      // Publish mic from the start; unique room per connect so each reconnect gets a new agent (Android closes connection if we add track later)
       await room.connect(
         url,
         token,
@@ -68,7 +82,6 @@ class VoiceService extends ChangeNotifier {
       _audioPlaybackFailed = false;
       _startGpsPublishing();
 
-      // Unlock web audio (Chrome requires user gesture; we're in the button tap here)
       try {
         await room.startAudio();
       } catch (e) {
@@ -85,6 +98,16 @@ class VoiceService extends ChangeNotifier {
   void _setUpRoomListeners(Room room) {
     _roomListener?.dispose();
     _roomListener = room.createListener()
+      ..on<RoomDisconnectedEvent>((_) {
+        if (_room == room) {
+          _gpsTimer?.cancel();
+          _gpsTimer = null;
+          _room = null;
+          _roomListener?.dispose();
+          _roomListener = null;
+          notifyListeners();
+        }
+      })
       ..on<TrackSubscribedEvent>((event) async {
         // When agent's audio track arrives, try to start playback (Chrome often blocks until user gesture)
         if (event.track.kind == TrackType.AUDIO) {
@@ -132,8 +155,9 @@ class VoiceService extends ChangeNotifier {
     if (_lat == null || _lng == null) return;
 
     try {
-      final payload = utf8.encode('{"lat":$_lat,"lng":$_lng}');
-      room.localParticipant?.publishData(payload, topic: _gpsTopic);
+      String payloadStr = '{"lat":$_lat,"lng":$_lng}';
+      if (_heading != null) payloadStr = '{"lat":$_lat,"lng":$_lng,"heading":$_heading}';
+      room.localParticipant?.publishData(utf8.encode(payloadStr), topic: _gpsTopic);
     } catch (e) {
       debugPrint('VoiceService GPS publish: $e');
     }
@@ -141,15 +165,20 @@ class VoiceService extends ChangeNotifier {
 
   /// Disconnect from the voice agent. Memory is kept; next connect will restore context.
   Future<void> disconnect() async {
+    final room = _room;
+    if (room == null) return;
+    _disconnecting = true;
     _gpsTimer?.cancel();
     _gpsTimer = null;
     _roomListener?.dispose();
     _roomListener = null;
-    _audioPlaybackFailed = false;
-    final room = _room;
     _room = null;
-    if (room != null) {
+    _audioPlaybackFailed = false;
+    try {
       await room.disconnect();
+      await Future<void>.delayed(const Duration(milliseconds: 600));
+    } finally {
+      _disconnecting = false;
     }
     notifyListeners();
   }

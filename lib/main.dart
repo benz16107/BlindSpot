@@ -1,8 +1,10 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+import 'package:flutter_compass/flutter_compass.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
@@ -55,6 +57,9 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
   StreamSubscription<Position>? _posSub;
   Position? _pos;
   String? _locError;
+  // Compass: 0 = north, 90 = east, 180 = south, 270 = west
+  double? _heading;
+  StreamSubscription<CompassEvent>? _compassSub;
 
   // Voice agent: on when button pressed, off when pressed again; memory kept on server
   final VoiceService _voiceService = VoiceService();
@@ -255,9 +260,16 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
         _status = "Camera + GPS ready.";
         _locError = null;
       });
-      _voiceService.updateGps(first.latitude, first.longitude);
+      _voiceService.updateGps(first.latitude, first.longitude, _heading);
 
-      // 4) Continuous updates while camera screen is open
+      // 4) Compass updates (heading 0–360)
+      _compassSub?.cancel();
+      _compassSub = FlutterCompass.events?.listen((CompassEvent e) {
+        if (!mounted) return;
+        if (e.heading != null) setState(() => _heading = e.heading);
+      });
+
+      // 5) Continuous position updates while camera screen is open
       const settings = LocationSettings(
         accuracy: LocationAccuracy.bestForNavigation,
         distanceFilter: 3, // meters before emitting an update
@@ -268,7 +280,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
         (p) {
           if (!mounted) return;
           setState(() => _pos = p);
-          _voiceService.updateGps(p.latitude, p.longitude);
+          _voiceService.updateGps(p.latitude, p.longitude, _heading);
         },
         onError: (e) {
           if (!mounted) return;
@@ -351,6 +363,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
     _voiceService.removeListener(_onVoiceStateChanged);
     _voiceService.disconnect();
     _posSub?.cancel();
+    _compassSub?.cancel();
     _controller?.dispose();
     super.dispose();
   }
@@ -573,6 +586,14 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                     ),
                   ),
 
+                  // Compass: direction you're facing (N/S/E/W)
+                  if (_heading != null)
+                    Positioned(
+                      left: 12,
+                      bottom: 12,
+                      child: _CompassWidget(heading: _heading!),
+                    ),
+
                   // Voice agent toggle: on = connect (mic + GPS), off = disconnect (memory kept)
                   Positioned(
                     right: 12,
@@ -594,4 +615,79 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
       ),
     );
   }
+}
+
+/// Compass showing current heading: N at top, needle points in direction of travel.
+class _CompassWidget extends StatelessWidget {
+  final double heading; // 0 = north, 90 = east (degrees)
+
+  const _CompassWidget({required this.heading});
+
+  @override
+  Widget build(BuildContext context) {
+    const double size = 56;
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: Colors.black.withOpacity(0.6),
+        border: Border.all(color: Colors.white38, width: 2),
+        boxShadow: [
+          BoxShadow(color: Colors.black.withOpacity(0.4), blurRadius: 8, spreadRadius: 1),
+        ],
+      ),
+      child: ClipOval(
+        child: CustomPaint(
+          size: const Size(size, size),
+          painter: _CompassPainter(heading: heading),
+        ),
+      ),
+    );
+  }
+}
+
+class _CompassPainter extends CustomPainter {
+  final double heading;
+
+  _CompassPainter({required this.heading});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+    final radius = size.width / 2 - 4;
+
+    // Cardinal labels (N at top; compass is fixed, needle rotates)
+    final textPainter = (String label, double angleDeg) {
+      final rad = (angleDeg - 90) * math.pi / 180;
+      final pos = center + Offset(radius * 0.75 * math.cos(rad), radius * 0.75 * math.sin(rad));
+      final p = TextPainter(
+        text: TextSpan(text: label, style: const TextStyle(color: Colors.white70, fontSize: 12, fontWeight: FontWeight.bold)),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      p.paint(canvas, pos - Offset(p.width / 2, p.height / 2));
+    };
+    textPainter('N', 0);
+    textPainter('E', 90);
+    textPainter('S', 180);
+    textPainter('W', 270);
+
+    // Needle: direction you're facing (rotates with heading)
+    canvas.save();
+    canvas.translate(center.dx, center.dy);
+    canvas.rotate(heading * math.pi / 180);
+    canvas.translate(-center.dx, -center.dy);
+    final needlePath = Path()
+      ..moveTo(center.dx, center.dy - radius * 0.5)
+      ..lineTo(center.dx - 6, center.dy + radius * 0.35)
+      ..lineTo(center.dx, center.dy + radius * 0.2)
+      ..lineTo(center.dx + 6, center.dy + radius * 0.35)
+      ..close();
+    canvas.drawPath(needlePath, Paint()..color = Colors.orange..style = PaintingStyle.fill);
+    canvas.drawPath(needlePath, Paint()..color = Colors.white..style = PaintingStyle.stroke..strokeWidth = 1.5);
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(covariant _CompassPainter old) => old.heading != heading;
 }
