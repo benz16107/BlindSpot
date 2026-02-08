@@ -81,9 +81,6 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
   bool _obstacleNear = false;
   String? _obstacleDescription;
   DateTime? _lastObstacleAnnounceTime; // TTS cooldown
-  static const _obstacleInterval = Duration(seconds: 2);
-  static const _obstacleHapticPeriod = Duration(milliseconds: 350); // constant vibration
-  static const _obstacleAnnounceCooldown = Duration(seconds: 6); // repeat voice warning
   final FlutterTts _tts = FlutterTts();
 
   @override
@@ -245,7 +242,12 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
   }
 
   void _onVoiceStateChanged() {
-    if (mounted) setState(() {});
+    if (!mounted) return;
+    if (!_voiceService.isConnected && _obstacleDetectionOn) {
+      _stopObstacleDetection();
+      setState(() => _obstacleDetectionOn = false);
+    }
+    setState(() {});
   }
 
   /// Obstacle endpoint: same host as token URL from config (only used when not using local Gemini).
@@ -256,7 +258,9 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
 
   void _startObstacleDetection() {
     _obstacleTimer?.cancel();
-    _obstacleTimer = Timer.periodic(_obstacleInterval, (_) => _runObstacleCheck());
+    final interval = Duration(seconds: obstacleCheckIntervalSeconds);
+    _obstacleTimer = Timer.periodic(interval, (_) => _runObstacleCheck());
+    _runObstacleCheck(); // run first check immediately
   }
 
   void _stopObstacleDetection() {
@@ -274,7 +278,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
   /// Constant haptic vibration while obstacle is detected.
   void _startObstacleAlerts(String description) {
     _obstacleHapticTimer?.cancel();
-    _obstacleHapticTimer = Timer.periodic(_obstacleHapticPeriod, (_) {
+    _obstacleHapticTimer = Timer.periodic(Duration(milliseconds: obstacleHapticPeriodMs), (_) {
       if (!_obstacleNear || !mounted) {
         _stopObstacleAlerts();
         return;
@@ -303,30 +307,11 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
       setState(() => _obstacleDetectionOn = false);
       _stopObstacleDetection();
     } else {
+      if (!_voiceService.isConnected) return;
       setState(() => _obstacleDetectionOn = true);
       _startObstacleDetection();
     }
   }
-
-  // --- OBJECT DETECTION: customize prompt and sensitivity ---
-  // Sensitivity: edit [obstacleAlertDistances] in lib/config.dart (add "far" for more alerts).
-  // Prompt: edit below. This is sent to Gemini with each camera frame (back camera, JPEG).
-  static const String _obstaclePrompt = r'''
-You are analyzing a single JPEG image from a smartphone's BACK CAMERA held by a blind pedestrian walking. The image shows what is in front of them (outdoor or indoor).
-
-TASK: Detect any object or person that could be in the way (could bump into it within a few steps).
-
-RULES:
-- "obstacle_detected": true if there is something in the path — in the center or lower-center of the frame (middle half of the image). It can be slightly left or right; if it is clearly in the walking path, say true.
-- "distance": use "near" if the object looks within ~2 m (fills a noticeable part of the frame); "medium" if ~2–4 m; "far" if farther but still in the path. Use "none" only if there is no relevant obstacle.
-- Report: person, pole, post, trash can, door, wall, vehicle, bench, or any solid object in the way. Do NOT report: ground, sky, distant buildings, or things clearly off to the side.
-- When in doubt whether something is in the path, prefer saying obstacle_detected true with the appropriate distance so the user can be cautious.
-
-Reply with JSON only, no other text, with these exact keys:
-- "obstacle_detected": true or false
-- "distance": one of "none", "far", "medium", "near"
-- "description": short phrase (e.g. "pole", "person", "trash can") or empty if none
-''';
 
   Future<void> _runObstacleCheck() async {
     if (!_obstacleDetectionOn) return;
@@ -350,7 +335,7 @@ Reply with JSON only, no other text, with these exact keys:
               body: bytes,
               headers: {'Content-Type': 'image/jpeg'},
             )
-            .timeout(const Duration(seconds: 10));
+            .timeout(Duration(seconds: obstacleRequestTimeoutSeconds));
         if (!mounted) return;
         if (response.statusCode != 200) {
           setState(() {
@@ -382,7 +367,7 @@ Reply with JSON only, no other text, with these exact keys:
         final now = DateTime.now();
         final shouldAnnounce = !wasNear ||
             _lastObstacleAnnounceTime == null ||
-            now.difference(_lastObstacleAnnounceTime!) > _obstacleAnnounceCooldown;
+            now.difference(_lastObstacleAnnounceTime!) > Duration(seconds: obstacleAnnounceCooldownSeconds);
         if (shouldAnnounce) {
           _lastObstacleAnnounceTime = now;
           if (_voiceService.isConnected) {
@@ -408,17 +393,17 @@ Reply with JSON only, no other text, with these exact keys:
   Future<Map<String, dynamic>?> _analyzeObstacleLocal(List<int> imageBytes) async {
     try {
       final model = GenerativeModel(
-        model: 'gemini-2.0-flash',
+        model: obstacleModel,
         apiKey: googleApiKey.trim(),
         generationConfig: GenerationConfig(
           responseMimeType: 'application/json',
-          temperature: 0.2,
+          temperature: obstacleTemperature,
         ),
       );
       final response = await model.generateContent([
         Content.multi([
           DataPart('image/jpeg', Uint8List.fromList(imageBytes)),
-          TextPart(_obstaclePrompt),
+          TextPart(obstaclePrompt),
         ]),
       ]);
       final text = response.text?.trim() ?? '';
@@ -686,7 +671,9 @@ Reply with JSON only, no other text, with these exact keys:
                                 Text(
                                   _obstacleDetectionOn
                                       ? 'Object detection: on'
-                                      : 'Object detection: off (tap ⚠ to turn on)',
+                                      : _voiceService.isConnected
+                                          ? 'Object detection: off (tap ⚠ to turn on)'
+                                          : 'Object detection: connect voice first',
                                   style: TextStyle(
                                     color: _obstacleDetectionOn ? Colors.orange.shade200 : Colors.white54,
                                     fontSize: 11,
@@ -752,14 +739,14 @@ Reply with JSON only, no other text, with these exact keys:
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        // Object detection: on = send frames to server, haptic when obstacle near
+                        // Object detection: only when voice is on; within 5 m and directly in front
                         FloatingActionButton(
                           heroTag: 'obstacle',
-                          onPressed: _onObstacleDetectionToggle,
+                          onPressed: _voiceService.isConnected ? _onObstacleDetectionToggle : null,
                           backgroundColor: _obstacleDetectionOn ? Colors.orange : null,
                           child: Icon(
                             Icons.warning_amber_rounded,
-                            color: _obstacleDetectionOn ? Colors.white : null,
+                            color: _obstacleDetectionOn ? Colors.white : (_voiceService.isConnected ? null : Colors.white38),
                           ),
                         ),
                         const SizedBox(width: 12),
