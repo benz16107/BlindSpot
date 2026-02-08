@@ -4,3 +4,6 @@ const String tokenUrl = String.fromEnvironment(
   'TOKEN_URL',
   defaultValue: 'http://localhost:8765/token',
 );
+
+/// Obstacle server runs on a separate port (only holds GOOGLE_API_KEY). Same host as token URL.
+const int obstacleServerPort = 8766;

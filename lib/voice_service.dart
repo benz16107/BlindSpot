@@ -18,6 +18,7 @@ class VoiceService extends ChangeNotifier {
   EventsListener<RoomEvent>? _roomListener;
 
   static const String _gpsTopic = 'gps';
+  static const String obstacleAlertTopic = 'obstacle_alert';
   static const Duration _gpsInterval = Duration(seconds: 3);
 
   bool get isConnected => _room != null;
@@ -160,6 +161,22 @@ class VoiceService extends ChangeNotifier {
       room.localParticipant?.publishData(utf8.encode(payloadStr), topic: _gpsTopic);
     } catch (e) {
       debugPrint('VoiceService GPS publish: $e');
+    }
+  }
+
+  /// Notify the voice agent so it can announce the obstacle (e.g. "Obstacle ahead, slow down.").
+  /// Call when obstacle detection returns obstacle_detected true. No-op if not connected.
+  void publishObstacleAlert(String distance, String description) {
+    final room = _room;
+    if (room == null) return;
+    try {
+      final payload = jsonEncode({
+        'distance': distance,
+        'description': description.isNotEmpty ? description : 'Obstacle in path',
+      });
+      room.localParticipant?.publishData(utf8.encode(payload), topic: obstacleAlertTopic);
+    } catch (e) {
+      debugPrint('VoiceService obstacle_alert publish: $e');
     }
   }
 

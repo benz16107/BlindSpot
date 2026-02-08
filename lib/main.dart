@@ -1,14 +1,20 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_compass/flutter_compass.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+import 'package:image/image.dart' as img;
 
 import 'config.dart';
 import 'voice_service.dart';
@@ -75,6 +81,13 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
   // Token server URL: on device use your computer's IP (e.g. http://192.168.1.x:8765/token)
   String? _tokenServerUrl;
 
+  // Obstacle detection: same server as token, POST camera frame -> Gemini -> haptics by distance
+  bool _obstacleDetectionOn = false;
+  Timer? _obstacleTimer;
+  Timer? _obstacleHapticTimer; // repeating haptic while obstacle is sensed
+  bool _obstacleRequestInProgress = false;
+  String? _obstacleError; // transient message when obstacle is on and request failed
+
   @override
   void initState() {
     super.initState();
@@ -90,6 +103,13 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
   }
 
   String get _effectiveTokenUrl => (_tokenServerUrl ?? tokenUrl).trim().isEmpty ? tokenUrl : (_tokenServerUrl ?? tokenUrl);
+
+  /// Obstacle server is separate (only API key); same host, different port (see config.dart).
+  String get _obstacleEndpointUrl {
+    final u = _effectiveTokenUrl;
+    final uri = Uri.parse(u);
+    return '${uri.scheme}://${uri.host}:${obstacleServerPort}/obstacle-frame';
+  }
 
   Future<void> _saveTokenServerUrl(String url) async {
     final trimmed = url.trim();
@@ -132,11 +152,17 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(context, null),
+            onPressed: () {
+              HapticFeedback.selectionClick();
+              Navigator.pop(context, null);
+            },
             child: const Text('Cancel'),
           ),
           TextButton(
-            onPressed: () => Navigator.pop(context, controller.text),
+            onPressed: () {
+              HapticFeedback.selectionClick();
+              Navigator.pop(context, controller.text);
+            },
             child: const Text('Save'),
           ),
         ],
@@ -151,6 +177,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
   }
 
   Future<void> _onVoiceButtonPressed() async {
+    HapticFeedback.selectionClick();
     if (_voiceConnecting) return;
     setState(() {
       _voiceError = null;
@@ -299,7 +326,108 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
   }
 
   void _onVoiceStateChanged() {
+    if (mounted) {
+      if (!_voiceService.isConnected && _obstacleDetectionOn) {
+        _stopObstacleDetection();
+      }
+      setState(() {});
+    }
+  }
+
+  void _startObstacleDetection() {
+    if (!_voiceService.isConnected) return;
+    _stopObstacleDetection();
+    _obstacleDetectionOn = true;
+    _obstacleTimer = Timer.periodic(const Duration(seconds: 2), (_) => _captureAndSendObstacleFrame());
     if (mounted) setState(() {});
+  }
+
+  void _stopObstacleDetection() {
+    _obstacleTimer?.cancel();
+    _obstacleTimer = null;
+    _obstacleHapticTimer?.cancel();
+    _obstacleHapticTimer = null;
+    _obstacleDetectionOn = false;
+    _obstacleError = null;
+    if (mounted) setState(() {});
+  }
+
+  void _stopObstacleHaptic() {
+    _obstacleHapticTimer?.cancel();
+    _obstacleHapticTimer = null;
+    if (mounted) setState(() {});
+  }
+
+  void _startObstacleHaptic() {
+    _obstacleHapticTimer?.cancel();
+    _obstacleHapticTimer = Timer.periodic(const Duration(milliseconds: 400), (_) {
+      if (!_obstacleDetectionOn) {
+        _stopObstacleHaptic();
+        return;
+      }
+      HapticFeedback.heavyImpact();
+    });
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _captureAndSendObstacleFrame() async {
+    if (_controller == null || !_controller!.value.isInitialized || !_obstacleDetectionOn || _obstacleRequestInProgress) return;
+    _obstacleRequestInProgress = true;
+    if (mounted) setState(() => _obstacleError = null);
+    try {
+      final XFile file = await _controller!.takePicture().timeout(
+        const Duration(seconds: 8),
+        onTimeout: () => throw TimeoutException('Camera capture'),
+      );
+      Uint8List bytes = await file.readAsBytes();
+      if (!_obstacleDetectionOn) return;
+      // Resize and compress so frame is always small enough for upload (obstacle detection doesn't need full res).
+      final decoded = img.decodeImage(bytes);
+      if (decoded != null) {
+        const maxWidth = 640;
+        final resized = decoded.width > maxWidth
+            ? img.copyResize(decoded, width: maxWidth)
+            : decoded;
+        bytes = Uint8List.fromList(img.encodeJpg(resized, quality: 72));
+      }
+      if (bytes.length > 400000) {
+        // Still too big; compress more
+        final decoded2 = img.decodeImage(bytes);
+        if (decoded2 != null) {
+          bytes = Uint8List.fromList(img.encodeJpg(img.copyResize(decoded2, width: 480), quality: 60));
+        }
+      }
+      final uri = Uri.parse(_obstacleEndpointUrl);
+      final resp = await http.post(uri, body: bytes, headers: {'Content-Type': 'image/jpeg'}).timeout(const Duration(seconds: 10));
+      if (!mounted || !_obstacleDetectionOn) return;
+      if (resp.statusCode != 200) {
+        _stopObstacleHaptic();
+        if (mounted) setState(() => _obstacleError = 'Server ${resp.statusCode}');
+        return;
+      }
+      final map = jsonDecode(resp.body) as Map<String, dynamic>?;
+      if (map == null) return;
+      final rawDetected = map['obstacle_detected'];
+      final detected = rawDetected == true ||
+          (rawDetected is String && rawDetected.toString().trim().toLowerCase() == 'true');
+      final distance = map['distance']?.toString().trim().toLowerCase() ?? 'none';
+      final description = map['description']?.toString().trim() ?? '';
+      // Only alert when very close and centered (~2 m) — i.e. distance "near" only.
+      if (detected && distance == 'near') {
+        _startObstacleHaptic(); // keep vibrating until next frame says clear
+        _voiceService.publishObstacleAlert(distance, description);
+      } else {
+        _stopObstacleHaptic();
+      }
+    } catch (e) {
+      _stopObstacleHaptic();
+      if (mounted && _obstacleDetectionOn) {
+        setState(() => _obstacleError = e is TimeoutException ? 'Camera busy' : 'No connection');
+      }
+    } finally {
+      _obstacleRequestInProgress = false;
+      if (mounted) setState(() {});
+    }
   }
 
   Future<void> _stopMicTest() async {
@@ -359,6 +487,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
 
   @override
   void dispose() {
+    _stopObstacleDetection();
     _stopMicTest();
     _voiceService.removeListener(_onVoiceStateChanged);
     _voiceService.disconnect();
@@ -393,7 +522,38 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                 children: [
                   Positioned.fill(
                     child: showCamera
-                        ? CameraPreview(controller!)
+                        ? LayoutBuilder(
+                            builder: (context, constraints) {
+                              double aspectRatio = controller.value.aspectRatio;
+                              if (aspectRatio <= 0) {
+                                return CameraPreview(controller);
+                              }
+                              final w = constraints.maxWidth;
+                              final h = constraints.maxHeight;
+                              // On portrait, camera sensor is often landscape so preview is rotated; use inverse ratio.
+                              final isPortrait = h > w;
+                              if (isPortrait && aspectRatio > 1) {
+                                aspectRatio = 1 / aspectRatio;
+                              }
+                              final deviceRatio = w / h;
+                              double scale = aspectRatio / deviceRatio;
+                              if (scale < 1) scale = 1 / scale;
+                              return ClipRect(
+                                child: OverflowBox(
+                                  alignment: Alignment.center,
+                                  child: Transform.scale(
+                                    scale: scale,
+                                    child: Center(
+                                      child: AspectRatio(
+                                        aspectRatio: aspectRatio,
+                                        child: CameraPreview(controller),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              );
+                            },
+                          )
                         : Container(color: Colors.black87, child: Center(child: Text(_status, style: const TextStyle(color: Colors.white54)))),
                   ),
 
@@ -425,7 +585,10 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                             if (_isConnectionRefused(_voiceError)) ...[
                               const SizedBox(height: 6),
                               GestureDetector(
-                                onTap: _showSetServerUrlDialog,
+                                onTap: () {
+                                  HapticFeedback.selectionClick();
+                                  _showSetServerUrlDialog();
+                                },
                                 child: Container(
                                   padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
                                   decoration: BoxDecoration(
@@ -473,7 +636,10 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                   ),
                                   const SizedBox(width: 8),
                                   GestureDetector(
-                                    onTap: _stopMicTest,
+                                    onTap: () {
+                                      HapticFeedback.selectionClick();
+                                      _stopMicTest();
+                                    },
                                     child: Text(
                                       'Stop',
                                       style: TextStyle(color: Colors.orange.shade200, fontSize: 12),
@@ -488,7 +654,10 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                               ),
                             ] else if (!_voiceService.isConnected && !_voiceConnecting) ...[
                               GestureDetector(
-                                onTap: _startMicTest,
+                                onTap: () {
+                                  HapticFeedback.selectionClick();
+                                  _startMicTest();
+                                },
                                 child: Container(
                                   padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                                   decoration: BoxDecoration(
@@ -526,7 +695,10 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                             if (!_voiceService.isConnected && !_voiceConnecting) ...[
                               const SizedBox(height: 6),
                               GestureDetector(
-                                onTap: _showSetServerUrlDialog,
+                                onTap: () {
+                                  HapticFeedback.selectionClick();
+                                  _showSetServerUrlDialog();
+                                },
                                 child: Row(
                                   mainAxisSize: MainAxisSize.min,
                                   children: [
@@ -563,6 +735,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                               const SizedBox(height: 6),
                               GestureDetector(
                                 onTap: () async {
+                                  HapticFeedback.selectionClick();
                                   await _voiceService.playbackAudio();
                                 },
                                 child: Container(
@@ -592,6 +765,82 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                       left: 12,
                       bottom: 12,
                       child: _CompassWidget(heading: _heading!),
+                    ),
+
+                  // Obstacle detection: camera frame -> server (Gemini) -> haptics by distance
+                  if (showCamera)
+                    Positioned(
+                      left: 12,
+                      bottom: 80,
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          if (_obstacleError != null && _obstacleDetectionOn) ...[
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              margin: const EdgeInsets.only(bottom: 4),
+                              decoration: BoxDecoration(
+                                color: Colors.black87,
+                                borderRadius: BorderRadius.circular(6),
+                              ),
+                              child: Text(
+                                _obstacleError!,
+                                style: const TextStyle(color: Colors.orangeAccent, fontSize: 10),
+                              ),
+                            ),
+                          ],
+                          Material(
+                            color: _voiceService.isConnected
+                                ? (_obstacleDetectionOn ? Colors.orange.withValues(alpha: 0.9) : Colors.black54)
+                                : Colors.black38,
+                            borderRadius: BorderRadius.circular(8),
+                            child: InkWell(
+                              onTap: () {
+                                HapticFeedback.selectionClick();
+                                if (_obstacleDetectionOn) {
+                                  _stopObstacleDetection();
+                                } else if (_voiceService.isConnected) {
+                                  _startObstacleDetection();
+                                } else {
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    const SnackBar(
+                                      content: Text('Enable the mic first to use obstacle detection'),
+                                      duration: Duration(seconds: 2),
+                                      behavior: SnackBarBehavior.floating,
+                                    ),
+                                  );
+                                }
+                              },
+                              borderRadius: BorderRadius.circular(8),
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(
+                                      _obstacleDetectionOn ? Icons.vibration : Icons.warning_amber_rounded,
+                                      color: _voiceService.isConnected ? Colors.white : Colors.white54,
+                                      size: 20,
+                                    ),
+                                    const SizedBox(width: 6),
+                                    Text(
+                                      _obstacleDetectionOn
+                                          ? 'Obstacle: on'
+                                          : (_voiceService.isConnected ? 'Obstacle' : 'Obstacle (mic first)'),
+                                      style: TextStyle(
+                                        color: _voiceService.isConnected ? Colors.white : Colors.white54,
+                                        fontWeight: FontWeight.w500,
+                                        fontSize: 12,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
 
                   // Voice agent toggle: on = connect (mic + GPS), off = disconnect (memory kept)

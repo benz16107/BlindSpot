@@ -1,7 +1,7 @@
 """
-Simple HTTP server that issues LiveKit access tokens for the mobile app.
+Token server: only loads API keys and issues LiveKit tokens.
 Run with: uv run python token_server.py
-Serves GET/POST .../token?identity=optional_id -> { "token": "...", "url": "wss://..." }
+GET /token?identity=...&room=... -> { "token": "...", "url": "wss://..." }
 """
 import os
 import json
@@ -13,11 +13,10 @@ from dotenv import load_dotenv
 
 load_dotenv(".env.local")
 
-# Optional: use LIVEKIT_URL for agent; mobile connects to same URL
+# API keys only (no other logic)
 LIVEKIT_URL = os.environ.get("LIVEKIT_URL", "").rstrip("/")
 LIVEKIT_API_KEY = os.environ.get("LIVEKIT_API_KEY", "")
 LIVEKIT_API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "")
-# Room name must be consistent so the agent (dispatched when participant joins) and app match
 ROOM_NAME = os.environ.get("LIVEKIT_ROOM_NAME", "voice-nav")
 
 
@@ -43,7 +42,7 @@ class TokenHandler(BaseHTTPRequestHandler):
             return
         qs = parse_qs(parsed.query)
         identity = (qs.get("identity") or ["mobile-user"])[0]
-        room_name = (qs.get("room") or [None])[0]  # optional; unique room per connection when provided
+        room_name = (qs.get("room") or [None])[0]
 
         try:
             if not LIVEKIT_URL:
@@ -71,7 +70,7 @@ class TokenHandler(BaseHTTPRequestHandler):
 def main():
     port = int(os.environ.get("TOKEN_SERVER_PORT", "8765"))
     server = HTTPServer(("0.0.0.0", port), TokenHandler)
-    print(f"Token server at http://0.0.0.0:{port}/token (LIVEKIT_URL={LIVEKIT_URL or 'NOT SET'})")
+    print(f"Token server http://0.0.0.0:{port}/token (API keys: LIVEKIT_*)")
     server.serve_forever()
 
 

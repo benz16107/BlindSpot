@@ -26,6 +26,8 @@ from mcp_client import MCPServerHttp, MCPToolsIntegration   # or MCPServerStream
 from backboard_store import init_backboard
 from google_maps import NavigationTool, GPS_DATA_TOPIC
 
+OBSTACLE_ALERT_TOPIC = "obstacle_alert"
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agent")
@@ -171,7 +173,32 @@ async def my_agent(ctx: agents.JobContext):
     import json as _json
 
     def _on_data_received(packet):
-        if (getattr(packet, "topic", None) or "") != GPS_DATA_TOPIC:
+        topic = (getattr(packet, "topic", None) or "").strip()
+        if topic == OBSTACLE_ALERT_TOPIC:
+            try:
+                payload = _json.loads(packet.data.decode("utf-8"))
+                distance = payload.get("distance") or "medium"
+                description = (payload.get("description") or "").strip()
+                if distance == "near":
+                    phrase = "Watch out! Something very close. " + (description or "Slow down.")
+                elif distance == "medium":
+                    phrase = "Obstacle ahead. " + (description or "Slow down.")
+                else:
+                    phrase = "Something in your path ahead. " + (description or "")
+                async def _announce_obstacle():
+                    try:
+                        session.interrupt()
+                        await session.say(phrase)
+                    except Exception as e:
+                        logger.debug("obstacle_alert say: %s", e)
+                try:
+                    asyncio.get_running_loop().create_task(_announce_obstacle())
+                except RuntimeError:
+                    pass
+            except Exception as e:
+                logger.debug("obstacle_alert parse: %s", e)
+            return
+        if topic != GPS_DATA_TOPIC:
             return
         try:
             payload = _json.loads(packet.data.decode("utf-8"))
@@ -205,7 +232,7 @@ async def my_agent(ctx: agents.JobContext):
             logger.debug(f"GPS data_received parse: {e}")
 
     room.on("data_received", _on_data_received)
-    logger.info("Subscribed to room GPS data (topic=%s)", GPS_DATA_TOPIC)
+    logger.info("Subscribed to room data (topic=%s, %s)", GPS_DATA_TOPIC, OBSTACLE_ALERT_TOPIC)
 
     def _on_participant_disconnected(participant):
         """When the phone disconnects, leave the room so next connect gets a fresh agent."""
