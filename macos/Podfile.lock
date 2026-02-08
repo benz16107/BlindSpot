@@ -1,0 +1,56 @@
+PODS:
+  - connectivity_plus (0.0.1):
+    - FlutterMacOS
+  - device_info_plus (0.0.1):
+    - FlutterMacOS
+  - flutter_webrtc (1.2.0):
+    - FlutterMacOS
+    - WebRTC-SDK (= 137.7151.04)
+  - FlutterMacOS (1.0.0)
+  - geolocator_apple (1.2.0):
+    - Flutter
+    - FlutterMacOS
+  - livekit_client (2.6.2):
+    - flutter_webrtc
+    - FlutterMacOS
+    - WebRTC-SDK (= 137.7151.04)
+  - WebRTC-SDK (137.7151.04)
+
+DEPENDENCIES:
+  - connectivity_plus (from `Flutter/ephemeral/.symlinks/plugins/connectivity_plus/macos`)
+  - device_info_plus (from `Flutter/ephemeral/.symlinks/plugins/device_info_plus/macos`)
+  - flutter_webrtc (from `Flutter/ephemeral/.symlinks/plugins/flutter_webrtc/macos`)
+  - FlutterMacOS (from `Flutter/ephemeral`)
+  - geolocator_apple (from `Flutter/ephemeral/.symlinks/plugins/geolocator_apple/darwin`)
+  - livekit_client (from `Flutter/ephemeral/.symlinks/plugins/livekit_client/macos`)
+
+SPEC REPOS:
+  trunk:
+    - WebRTC-SDK
+
+EXTERNAL SOURCES:
+  connectivity_plus:
+    :path: Flutter/ephemeral/.symlinks/plugins/connectivity_plus/macos
+  device_info_plus:
+    :path: Flutter/ephemeral/.symlinks/plugins/device_info_plus/macos
+  flutter_webrtc:
+    :path: Flutter/ephemeral/.symlinks/plugins/flutter_webrtc/macos
+  FlutterMacOS:
+    :path: Flutter/ephemeral
+  geolocator_apple:
+    :path: Flutter/ephemeral/.symlinks/plugins/geolocator_apple/darwin
+  livekit_client:
+    :path: Flutter/ephemeral/.symlinks/plugins/livekit_client/macos
+
+SPEC CHECKSUMS:
+  connectivity_plus: 4adf20a405e25b42b9c9f87feff8f4b6fde18a4e
+  device_info_plus: 4fb280989f669696856f8b129e4a5e3cd6c48f76
+  flutter_webrtc: 718eae22a371cd94e5d56aa4f301443ebc5bb737
+  FlutterMacOS: d0db08ddef1a9af05a5ec4b724367152bb0500b1
+  geolocator_apple: ab36aa0e8b7d7a2d7639b3b4e48308394e8cef5e
+  livekit_client: 88896741c183040b2d72e95156eadf4902880cf6
+  WebRTC-SDK: 40d4f5ba05cadff14e4db5614aec402a633f007e
+
+PODFILE CHECKSUM: 54d867c82ac51cbd61b565781b9fada492027009
+
+COCOAPODS: 1.16.2
