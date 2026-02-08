@@ -40,7 +40,7 @@ class Assistant(Agent):
 
 server = AgentServer()
 
-@server.rtc_session()
+@server.rtc_session(agent_name="voice-agent")
 async def my_agent(ctx: agents.JobContext):
     room_name = getattr(ctx.room, "name", None) or "unknown"
     logger.info("Agent job started for room=%s", room_name)
