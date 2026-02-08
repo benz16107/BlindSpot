@@ -1,21 +1,39 @@
 import asyncio
 import os
+import logging
+from pathlib import Path
+from typing import Optional
+
 import googlemaps
 import requests
 from livekit.agents import llm
-import logging
 from navigation import NavigationSession
 from google.genai import Client
 from google.genai import types
 
+# Ensure .env.local is loaded from project root (same as agent.py), in case this
+# module is imported before agent's load_dotenv or from a different cwd.
+_env_path = Path(__file__).resolve().parent / ".env.local"
+if _env_path.exists():
+    from dotenv import load_dotenv
+    load_dotenv(_env_path)
+
 logger = logging.getLogger("google_maps")
+
+# Topic for GPS data messages from the phone (must match Flutter publishData topic)
+GPS_DATA_TOPIC = "gps"
+
 
 class NavigationTool:
     def __init__(self):
-        # Initialize Google Maps Client
+        # Initialize Google Maps Client (read again after dotenv load)
         api_key = os.environ.get("GOOGLE_MAPS_API_KEY")
+        if api_key:
+            api_key = api_key.strip()
+        self._latest_lat: Optional[float] = None
+        self._latest_lng: Optional[float] = None
         if not api_key:
-            logger.warning("GOOGLE_MAPS_API_KEY not found in environment variables")
+            logger.warning("GOOGLE_MAPS_API_KEY not found or empty in environment")
             self.client = None
         else:
             self.client = googlemaps.Client(key=api_key)
@@ -29,6 +47,18 @@ class NavigationTool:
             self.genai_client = Client(api_key=gemini_key)
         
         self.session = NavigationSession()
+
+    def set_latest_gps(self, lat: float, lng: float) -> None:
+        """Update latest GPS from phone (called when room receives data on topic gps)."""
+        self._latest_lat = lat
+        self._latest_lng = lng
+
+    @llm.function_tool(description="Get the user's current location. Use when they ask 'where am I?' or 'what's my location?'. Uses live GPS from the phone.")
+    async def get_current_location(self) -> str:
+        """Return current location from latest GPS sent by the phone."""
+        if self._latest_lat is None or self._latest_lng is None:
+            return "Location not available yet. Make sure the app is open and sending GPS."
+        return f"Current location: {self._latest_lat:.6f}, {self._latest_lng:.6f} (latitude, longitude)."
 
     @llm.function_tool(description="Start turn-by-turn navigation from an origin to a destination. Use this when the user wants to be guided step-by-step (e.g. 'navigate me to X', 'guide me to Y').")
     async def start_navigation(self, origin: str, destination: str, mode: str = "walking") -> str:

@@ -4,7 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.10, <3.13"
 dependencies = [
     "backboard-sdk>=1.4.12",
-    "livekit-agents[google]>=1.3.12",
+    "livekit-agents[google,elevenlabs,deepgram,silero,turn-detector]>=1.3.12",
     "livekit-plugins-noise-cancellation>=0.2.5",
     # "livekit-plugins-openai>=1.3.12",  # Commented out - using Google Gemini instead
     "google-genai>=0.4.0",
