@@ -1,12 +1,24 @@
 import 'dart:async';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:record/record.dart';
+
+import 'config.dart';
+import 'voice_service.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  final cameras = await availableCameras();
+  List<CameraDescription> cameras = [];
+  try {
+    cameras = await availableCameras();
+  } catch (e) {
+    // Camera plugin not implemented on this platform (e.g. macOS desktop)
+    cameras = [];
+  }
   runApp(MyApp(cameras: cameras));
 }
 
@@ -41,18 +53,31 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
   Position? _pos;
   String? _locError;
 
+  // Voice agent: on when button pressed, off when pressed again; memory kept on server
+  final VoiceService _voiceService = VoiceService();
+  bool _voiceConnecting = false;
+  String? _voiceError;
+
+  // Mic level indicator: test when not connected to voice (record package)
+  final AudioRecorder _audioRecorder = AudioRecorder();
+  bool _micTesting = false;
+  double? _micLevel; // 0..1 normalized from dBFS
+  StreamSubscription<Amplitude>? _micLevelSub;
+
   @override
   void initState() {
     super.initState();
+    _voiceService.addListener(_onVoiceStateChanged);
     _start();
   }
 
   Future<void> _start() async {
     if (widget.cameras.isEmpty) {
       setState(() {
-        _status = "No cameras found.";
+        _status = "No camera (e.g. macOS). GPS + voice only.";
         _initializing = false;
       });
+      await _startLocation();
       return;
     }
 
@@ -132,6 +157,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
         _status = "Camera + GPS ready.";
         _locError = null;
       });
+      _voiceService.updateGps(first.latitude, first.longitude);
 
       // 4) Continuous updates while camera screen is open
       const settings = LocationSettings(
@@ -144,6 +170,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
         (p) {
           if (!mounted) return;
           setState(() => _pos = p);
+          _voiceService.updateGps(p.latitude, p.longitude);
         },
         onError: (e) {
           if (!mounted) return;
@@ -161,8 +188,90 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
     }
   }
 
+  void _onVoiceStateChanged() {
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _onVoiceButtonPressed() async {
+    if (_voiceConnecting) return;
+    setState(() {
+      _voiceError = null;
+      _voiceConnecting = true;
+    });
+    try {
+      await _voiceService.toggle();
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _voiceError = e.toString();
+          _voiceConnecting = false;
+        });
+      }
+      return;
+    }
+    if (mounted) setState(() => _voiceConnecting = false);
+  }
+
+  Future<void> _stopMicTest() async {
+    await _micLevelSub?.cancel();
+    _micLevelSub = null;
+    try {
+      await _audioRecorder.stop();
+    } catch (_) {}
+    if (mounted) {
+      setState(() {
+        _micTesting = false;
+        _micLevel = null;
+      });
+    }
+  }
+
+  Future<void> _startMicTest() async {
+    if (_voiceService.isConnected || _micTesting) return;
+    final hasPermission = await _audioRecorder.hasPermission();
+    if (!hasPermission) {
+      if (mounted) {
+        setState(() => _voiceError = 'Mic permission denied');
+      }
+      return;
+    }
+    String path;
+    try {
+      final dir = await getTemporaryDirectory();
+      path = '${dir.path}/mic_test_${DateTime.now().millisecondsSinceEpoch}.m4a';
+    } catch (_) {
+      path = 'mic_test.m4a';
+    }
+    try {
+      await _audioRecorder.start(const RecordConfig(), path: path);
+    } catch (e) {
+      if (mounted) setState(() => _voiceError = 'Mic start: $e');
+      return;
+    }
+    setState(() {
+      _micTesting = true;
+      _micLevel = 0;
+      _voiceError = null;
+    });
+    // dBFS: roughly -60 (quiet) to 0 (loud); normalize to 0..1
+    _micLevelSub = _audioRecorder
+        .onAmplitudeChanged(const Duration(milliseconds: 100))
+        .listen((Amplitude a) {
+      if (!mounted || !_micTesting) return;
+      final normalized = (a.current + 60) / 60;
+      setState(() => _micLevel = normalized.clamp(0.0, 1.0));
+    });
+    // Auto-stop after 15 seconds
+    Future<void>.delayed(const Duration(seconds: 15), () {
+      if (_micTesting) _stopMicTest();
+    });
+  }
+
   @override
   void dispose() {
+    _stopMicTest();
+    _voiceService.removeListener(_onVoiceStateChanged);
+    _voiceService.disconnect();
     _posSub?.cancel();
     _controller?.dispose();
     super.dispose();
@@ -180,9 +289,10 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
   Widget build(BuildContext context) {
     final controller = _controller;
 
+    final showCamera = controller != null && controller.value.isInitialized;
     return Scaffold(
       body: SafeArea(
-        child: _initializing || controller == null || !controller.value.isInitialized
+        child: _initializing && controller == null
             ? Container(
                 color: Colors.black,
                 alignment: Alignment.center,
@@ -190,7 +300,11 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
               )
             : Stack(
                 children: [
-                  Positioned.fill(child: CameraPreview(controller)),
+                  Positioned.fill(
+                    child: showCamera
+                        ? CameraPreview(controller!)
+                        : Container(color: Colors.black87, child: Center(child: Text(_status, style: const TextStyle(color: Colors.white54)))),
+                  ),
 
                   // Status + GPS overlay
                   Positioned(
@@ -209,20 +323,150 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                           Text(_status, style: const TextStyle(color: Colors.white)),
                           const SizedBox(height: 6),
                           Text(_locationLine(), style: const TextStyle(color: Colors.white)),
+                          if (_voiceError != null) ...[
+                            const SizedBox(height: 4),
+                            Text('Voice: $_voiceError', style: const TextStyle(color: Colors.orangeAccent)),
+                          ] else ...[
+                            const SizedBox(height: 4),
+                            Text(
+                              _voiceConnecting
+                                  ? 'Voice: connecting…'
+                                  : _voiceService.isConnected
+                                      ? 'Voice: on'
+                                      : 'Voice: off (tap mic to start)',
+                              style: const TextStyle(color: Colors.white70),
+                            ),
+                            // Mic level: test when not connected, or "live" when connected
+                            const SizedBox(height: 6),
+                            if (_micTesting) ...[
+                              Row(
+                                children: [
+                                  SizedBox(
+                                    width: 120,
+                                    height: 20,
+                                    child: ClipRRect(
+                                      borderRadius: BorderRadius.circular(4),
+                                      child: LinearProgressIndicator(
+                                        value: _micLevel ?? 0,
+                                        backgroundColor: Colors.white24,
+                                        valueColor: const AlwaysStoppedAnimation<Color>(Colors.green),
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Text(
+                                    'Mic: ${((_micLevel ?? 0) * 100).toStringAsFixed(0)}%',
+                                    style: const TextStyle(color: Colors.white70, fontSize: 12),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  GestureDetector(
+                                    onTap: _stopMicTest,
+                                    child: Text(
+                                      'Stop',
+                                      style: TextStyle(color: Colors.orange.shade200, fontSize: 12),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                'Listening… speak to test (stops in 15s or tap Stop)',
+                                style: TextStyle(color: Colors.white54, fontSize: 11),
+                              ),
+                            ] else if (!_voiceService.isConnected && !_voiceConnecting) ...[
+                              GestureDetector(
+                                onTap: _startMicTest,
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                  decoration: BoxDecoration(
+                                    color: Colors.white24,
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  child: const Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(Icons.mic_none, size: 18, color: Colors.white70),
+                                      SizedBox(width: 6),
+                                      Text('Test mic level', style: TextStyle(color: Colors.white70, fontSize: 12)),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ] else if (_voiceService.isConnected) ...[
+                              Row(
+                                children: [
+                                  Container(
+                                    width: 8,
+                                    height: 8,
+                                    decoration: const BoxDecoration(
+                                      color: Colors.green,
+                                      shape: BoxShape.circle,
+                                      boxShadow: [BoxShadow(color: Colors.green, blurRadius: 4)],
+                                    ),
+                                  ),
+                                  const SizedBox(width: 6),
+                                  Text('Mic live (sending to agent)', style: TextStyle(color: Colors.white70, fontSize: 12)),
+                                ],
+                              ),
+                            ],
+                            if (kIsWeb && !_voiceService.isConnected && !_voiceConnecting) ...[
+                              const SizedBox(height: 2),
+                              Text(
+                                'Chrome: allow mic when prompted. After connecting, tap "Tap to enable speaker" if you can\'t hear.',
+                                style: TextStyle(color: Colors.white54, fontSize: 11),
+                              ),
+                            ],
+                            // Chrome: show speaker unlock when playback failed OR when on web and connected (tap proactively)
+                            if (_voiceService.audioPlaybackFailed || (kIsWeb && _voiceService.isConnected)) ...[
+                              if (kIsWeb) ...[
+                                const SizedBox(height: 4),
+                                Text(
+                                  'Chrome: allow microphone when prompted. If you can\'t hear the agent, tap below.',
+                                  style: TextStyle(color: Colors.white70, fontSize: 12),
+                                ),
+                              ],
+                              const SizedBox(height: 6),
+                              GestureDetector(
+                                onTap: () async {
+                                  await _voiceService.playbackAudio();
+                                },
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                                  decoration: BoxDecoration(
+                                    color: Colors.orange.withOpacity(0.9),
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  child: Text(
+                                    _voiceService.audioPlaybackFailed
+                                        ? 'Tap to enable speaker (Chrome)'
+                                        : 'Tap to enable speaker',
+                                    style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w500),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ],
                         ],
                       ),
                     ),
                   ),
 
-                  // (Optional) button to copy lat/lng later
-                  // Positioned(
-                  //   right: 12,
-                  //   bottom: 12,
-                  //   child: FloatingActionButton(
-                  //     onPressed: () {},
-                  //     child: const Icon(Icons.my_location),
-                  //   ),
-                  // ),
+                  // Voice agent toggle: on = connect (mic + GPS), off = disconnect (memory kept)
+                  Positioned(
+                    right: 12,
+                    bottom: 12,
+                    child: FloatingActionButton(
+                      onPressed: _voiceConnecting ? null : _onVoiceButtonPressed,
+                      backgroundColor: _voiceService.isConnected ? Colors.green : null,
+                      child: _voiceConnecting
+                          ? const SizedBox(
+                              width: 24,
+                              height: 24,
+                              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                            )
+                          : const Icon(Icons.mic),
+                    ),
+                  ),
                 ],
               ),
       ),
