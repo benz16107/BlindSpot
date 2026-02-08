@@ -79,6 +79,7 @@ class VoiceService extends ChangeNotifier {
       url = liveKitUrl.trim();
       if (url.startsWith('http://')) url = 'ws${url.substring(4)}';
       if (url.startsWith('https://')) url = 'wss${url.substring(5)}';
+      debugPrint('VoiceService: connecting to $url room=$roomName (in-app token). Ensure agent.py uses same LIVEKIT_URL.');
     } else {
       final tokenServerUrl = (tokenUrlOverride ?? tokenUrl).trim();
       if (tokenServerUrl.isEmpty) {
@@ -102,6 +103,7 @@ class VoiceService extends ChangeNotifier {
       }
       token = t;
       url = u;
+      debugPrint('VoiceService: connecting to token server room (url from server).');
     }
 
     try {
@@ -126,6 +128,7 @@ class VoiceService extends ChangeNotifier {
         debugPrint('VoiceService startAudio: $e');
       }
 
+      debugPrint('VoiceService: connected to room ${room.name}');
       notifyListeners();
     } catch (e, st) {
       debugPrint('VoiceService.connect error: $e $st');
