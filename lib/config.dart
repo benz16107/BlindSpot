@@ -19,7 +19,7 @@ const String googleApiKey = String.fromEnvironment(
   defaultValue: 'AIzaSyDeLs0ssVGAD5sXD3L_2Z7MDteJIJh06H8',
 );
 
-/// LiveKit server URL. Set via --dart-define=LIVEKIT_URL=...
+/// LiveKit server URL. Must match LIVEKIT_URL in .env.local used by agent.py so app and agent join the same cloud.
 const String liveKitUrl = String.fromEnvironment(
   'LIVEKIT_URL',
   defaultValue: 'wss://testproject-o9b5hv33.livekit.cloud',
