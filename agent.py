@@ -48,41 +48,44 @@ async def my_agent(ctx: agents.JobContext):
         # Continue without memory - voice still works
         memory_manager = None
     
-    # 2. Load thread history and format as context
+    # 2. Load thread history (keep small for low latency)
     context_text = ""
     if memory_manager:
-        thread_history = await memory_manager.load_thread_history(limit=50)
+        thread_history = await memory_manager.load_thread_history(limit=20)
         context_text = memory_manager.format_context_for_llm(thread_history)
         logger.debug(f"Loaded context: {len(thread_history)} messages, {len(context_text)} chars")
-    
-    # 3. Create session with injected context
+
+    # 3. Short instructions = faster first token; thinking off = much lower latency
     base_instructions = (
-        "You are a helpful multi-lingual voice AI assistant solely for navigation for blind people, you can communicate in multiple languages. "
-        "The user's phone sends live GPS to you. Use get_current_location when they ask 'where am I?' or 'what's my location?'. "
-        "For navigation, use start_navigation with origin 'current location' when they want to start from where they are. "
-        "During turn-by-turn navigation, you will get GPS updates automatically and speak the next instruction when they approach a turn. "
-        "You can also use the tools provided to you (Zapier MCP Server) when relevant."
+        "You are a concise voice navigation assistant for blind users. Multilingual. "
+        "Phone sends live GPS. Use get_current_location for 'where am I?'. "
+        "For 'navigate to X' or 'take me to Y' use start_navigation(origin='current location', destination=X or Y). Never ask for start address. "
+        "Turn-by-turn is automatic from GPS. Use Zapier tools when relevant. Keep replies brief."
     )
-    
-    if context_text:
-        full_instructions = f"{base_instructions}\n\n{context_text}"
-    else:
-        full_instructions = base_instructions
-    
-    # Voice pipeline: Deepgram STT + Gemini (with thinking) + ElevenLabs TTS
-    # Set DEEPGRAM_API_KEY, ELEVEN_API_KEY; optionally ELEVEN_VOICE_ID in .env.local
+    full_instructions = f"{base_instructions}\n\n{context_text}".strip() if context_text else base_instructions
+
+    # Voice pipeline: Deepgram STT + Gemini (no thinking for speed) + ElevenLabs TTS
+    # Set ELEVEN_API_KEY in .env.local (required). Optional: ELEVEN_VOICE_ID, ELEVEN_MODEL
+    eleven_key = os.environ.get("ELEVEN_API_KEY", "").strip()
+    if not eleven_key:
+        logger.warning("ELEVEN_API_KEY is not set; ElevenLabs TTS will fail (no audio frames)")
     session = AgentSession(
         stt=deepgram.STT(model="nova-2", language="en"),
         llm=google.LLM(
             model="gemini-2.5-flash",
-            thinking_config=types.ThinkingConfig(thinking_budget=-1),  # -1 = dynamic thinking
+            thinking_config=types.ThinkingConfig(thinking_budget=0),  # 0 = no thinking, faster replies
         ),
         tts=elevenlabs.TTS(
+            api_key=eleven_key or None,
             voice_id=os.environ.get("ELEVEN_VOICE_ID", "EXAVITQu4vr4xnSDxMaL"),
             model=os.environ.get("ELEVEN_MODEL", "eleven_multilingual_v2"),
         ),
-        vad=silero.VAD.load(),
-        turn_detection="vad",  # VAD-only; no turn-detector model download needed
+        vad=silero.VAD.load(
+            min_speech_duration=0.4,    # require ~400ms speech before treating as user (reduces cutoffs)
+            min_silence_duration=1.0,   # wait 1s before end-of-turn (let agent finish)
+            activation_threshold=0.65,  # need clearer speech to interrupt (less noise triggers)
+        ),
+        turn_detection="vad",
         allow_interruptions=True,
     )
 
@@ -118,26 +121,31 @@ async def my_agent(ctx: agents.JobContext):
     #     name="SSE MCP Server"
     # )
 
-    mcp_server = MCPServerHttp(
-        params={
-            "url": os.environ.get("ZAPIER_MCP_URL"),
-            # headers optional but commonly needed now
-            "headers": {
-                "Authorization": f"Bearer {os.environ.get('ZAPIER_MCP_TOKEN')}"
-            }
-        },
-        cache_tools_list=True,
-        name="Zapier MCP Server"
-    )
+    try:
+        mcp_server = MCPServerHttp(
+            params={
+                "url": os.environ.get("ZAPIER_MCP_URL"),
+                "headers": {
+                    "Authorization": f"Bearer {os.environ.get('ZAPIER_MCP_TOKEN')}"
+                }
+            },
+            cache_tools_list=True,
+            name="Zapier MCP Server"
+        )
+        agent = await MCPToolsIntegration.create_agent_with_tools(
+            agent_class=Assistant,
+            mcp_servers=[mcp_server],
+            agent_kwargs={"instructions": full_instructions},
+            memory_manager=memory_manager
+        )
+        logger.info("Agent created with MCP (Zapier) tools")
+    except Exception as e:
+        logger.warning("MCP failed, using navigation-only agent: %s", e)
+        agent = Assistant(instructions=full_instructions)
+        if not getattr(agent, "_tools", None) or not isinstance(agent._tools, list):
+            agent._tools = []
 
-    agent = await MCPToolsIntegration.create_agent_with_tools(
-        agent_class=Assistant,
-        mcp_servers=[mcp_server],
-        agent_kwargs={"instructions": full_instructions},
-        memory_manager=memory_manager  # Pass memory manager to tools
-    )
-
-    # Register Google Maps navigation tools so the agent can provide directions
+    # Register Google Maps navigation tools
     nav_tool = NavigationTool()
     if nav_tool.client:
         logger.info("Google Maps API key loaded; navigation tools enabled")
@@ -188,6 +196,15 @@ async def my_agent(ctx: agents.JobContext):
     room.on("data_received", _on_data_received)
     logger.info("Subscribed to room GPS data (topic=%s)", GPS_DATA_TOPIC)
 
+    async def say_greeting():
+        """Ask where to go as soon as the session is ready (mic enabled)."""
+        await asyncio.sleep(2.0)
+        try:
+            await session.say("Where would you like to go?")
+        except Exception as e:
+            logger.debug("Greeting say: %s", e)
+
+    asyncio.create_task(say_greeting())
     await session.start(
         room=ctx.room,
         agent=agent,

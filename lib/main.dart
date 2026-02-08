@@ -6,9 +6,12 @@ import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'config.dart';
 import 'voice_service.dart';
+
+const String _tokenServerUrlKey = 'token_server_url';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -64,11 +67,106 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
   double? _micLevel; // 0..1 normalized from dBFS
   StreamSubscription<Amplitude>? _micLevelSub;
 
+  // Token server URL: on device use your computer's IP (e.g. http://192.168.1.x:8765/token)
+  String? _tokenServerUrl;
+
   @override
   void initState() {
     super.initState();
     _voiceService.addListener(_onVoiceStateChanged);
+    _loadTokenServerUrl();
     _start();
+  }
+
+  Future<void> _loadTokenServerUrl() async {
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getString(_tokenServerUrlKey);
+    if (mounted) setState(() => _tokenServerUrl = saved?.trim().isEmpty == true ? null : saved);
+  }
+
+  String get _effectiveTokenUrl => (_tokenServerUrl ?? tokenUrl).trim().isEmpty ? tokenUrl : (_tokenServerUrl ?? tokenUrl);
+
+  Future<void> _saveTokenServerUrl(String url) async {
+    final trimmed = url.trim();
+    final prefs = await SharedPreferences.getInstance();
+    if (trimmed.isEmpty) {
+      await prefs.remove(_tokenServerUrlKey);
+      if (mounted) setState(() => _tokenServerUrl = null);
+    } else {
+      await prefs.setString(_tokenServerUrlKey, trimmed);
+      if (mounted) setState(() => _tokenServerUrl = trimmed);
+    }
+  }
+
+  Future<void> _showSetServerUrlDialog() async {
+    final controller = TextEditingController(text: _tokenServerUrl ?? tokenUrl);
+    if (!mounted) return;
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Token server URL'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'On a physical device, use your computer\'s IP so the app can reach the token server.',
+              style: TextStyle(fontSize: 13),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              decoration: const InputDecoration(
+                hintText: 'http://192.168.1.x:8765/token',
+                border: OutlineInputBorder(),
+              ),
+              autocorrect: false,
+              keyboardType: TextInputType.url,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, null),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, controller.text),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (result != null) await _saveTokenServerUrl(result);
+  }
+
+  static bool _isConnectionRefused(dynamic e) {
+    final s = e.toString().toLowerCase();
+    return s.contains('connection refused') || s.contains('socketexception') || s.contains('errno 111');
+  }
+
+  Future<void> _onVoiceButtonPressed() async {
+    if (_voiceConnecting) return;
+    setState(() {
+      _voiceError = null;
+      _voiceConnecting = true;
+    });
+    try {
+      if (_voiceService.isConnected) {
+        await _voiceService.disconnect();
+      } else {
+        await _voiceService.connect(tokenUrlOverride: _effectiveTokenUrl);
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _voiceError = e.toString();
+          _voiceConnecting = false;
+        });
+      }
+      return;
+    }
+    if (mounted) setState(() => _voiceConnecting = false);
   }
 
   Future<void> _start() async {
@@ -192,26 +290,6 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
     if (mounted) setState(() {});
   }
 
-  Future<void> _onVoiceButtonPressed() async {
-    if (_voiceConnecting) return;
-    setState(() {
-      _voiceError = null;
-      _voiceConnecting = true;
-    });
-    try {
-      await _voiceService.toggle();
-    } catch (e) {
-      if (mounted) {
-        setState(() {
-          _voiceError = e.toString();
-          _voiceConnecting = false;
-        });
-      }
-      return;
-    }
-    if (mounted) setState(() => _voiceConnecting = false);
-  }
-
   Future<void> _stopMicTest() async {
     await _micLevelSub?.cancel();
     _micLevelSub = null;
@@ -325,7 +403,29 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                           Text(_locationLine(), style: const TextStyle(color: Colors.white)),
                           if (_voiceError != null) ...[
                             const SizedBox(height: 4),
-                            Text('Voice: $_voiceError', style: const TextStyle(color: Colors.orangeAccent)),
+                            Text(
+                              _isConnectionRefused(_voiceError)
+                                  ? 'Voice: Can\'t reach token server. On a device, set your computer\'s IP below.'
+                                  : 'Voice: $_voiceError',
+                              style: const TextStyle(color: Colors.orangeAccent),
+                            ),
+                            if (_isConnectionRefused(_voiceError)) ...[
+                              const SizedBox(height: 6),
+                              GestureDetector(
+                                onTap: _showSetServerUrlDialog,
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                                  decoration: BoxDecoration(
+                                    color: Colors.orange.withValues(alpha: 0.9),
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  child: const Text(
+                                    'Set server URL (e.g. http://YOUR_MAC_IP:8765/token)',
+                                    style: TextStyle(color: Colors.white, fontWeight: FontWeight.w500, fontSize: 12),
+                                  ),
+                                ),
+                              ),
+                            ],
                           ] else ...[
                             const SizedBox(height: 4),
                             Text(
@@ -407,6 +507,28 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                   const SizedBox(width: 6),
                                   Text('Mic live (sending to agent)', style: TextStyle(color: Colors.white70, fontSize: 12)),
                                 ],
+                              ),
+                            ],
+                            // Let user set token server URL (required on physical device = computer's IP)
+                            if (!_voiceService.isConnected && !_voiceConnecting) ...[
+                              const SizedBox(height: 6),
+                              GestureDetector(
+                                onTap: _showSetServerUrlDialog,
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(Icons.settings_ethernet, size: 14, color: Colors.white54),
+                                    const SizedBox(width: 4),
+                                    Text(
+                                      'Server: ${_tokenServerUrl ?? tokenUrl}',
+                                      style: TextStyle(color: Colors.white54, fontSize: 11),
+                                      overflow: TextOverflow.ellipsis,
+                                      maxLines: 1,
+                                    ),
+                                    const SizedBox(width: 4),
+                                    Text('Change', style: TextStyle(color: Colors.orange.shade200, fontSize: 11)),
+                                  ],
+                                ),
                               ),
                             ],
                             if (kIsWeb && !_voiceService.isConnected && !_voiceConnecting) ...[
