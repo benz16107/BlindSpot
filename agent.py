@@ -39,6 +39,8 @@ server = AgentServer()
 
 @server.rtc_session()
 async def my_agent(ctx: agents.JobContext):
+    room_name = getattr(ctx.room, "name", None) or "unknown"
+    logger.info("Agent job started for room=%s", room_name)
     # 1. Initialize Backboard memory FIRST
     try:
         memory_manager = await init_backboard()
@@ -57,9 +59,10 @@ async def my_agent(ctx: agents.JobContext):
 
     # 3. Short instructions = faster first token; thinking off = much lower latency
     base_instructions = (
-        "You are a concise voice navigation assistant for blind users. Multilingual. "
+        "You are a concise voice walking navigation assistant for blind users. Multilingual. "
         "Phone sends live GPS. Use get_current_location for 'where am I?'. "
-        "For 'navigate to X' or 'take me to Y' use start_navigation(origin='current location', destination=X or Y). Never ask for start address. "
+        "For 'navigate to X' or 'take me to Y' (with a specific address or place name) use start_navigation(origin='current location', destination=X or Y). Never ask for start address. "
+        "For 'navigate to a nearby X', 'nearest Y', 'find a Z and take me there' use navigate_to_nearby(place_query) with just the place type (e.g. 'McDonald's', 'coffee shop', 'pharmacy') — do NOT use start_navigation with a vague destination like 'nearby McDonald's'. "
         "Turn-by-turn is automatic from GPS. Use Zapier tools when relevant. Keep replies brief."
     )
     full_instructions = f"{base_instructions}\n\n{context_text}".strip() if context_text else base_instructions
@@ -154,8 +157,10 @@ async def my_agent(ctx: agents.JobContext):
     if hasattr(agent, "_tools") and isinstance(agent._tools, list):
         agent._tools.extend([
             nav_tool.start_navigation,
+            nav_tool.navigate_to_nearby,
             nav_tool.update_location,
             nav_tool.get_current_location,
+            nav_tool.get_heading,
             nav_tool.get_walking_directions,
             nav_tool.search_places,
         ])
@@ -175,7 +180,13 @@ async def my_agent(ctx: agents.JobContext):
             if lat is None or lng is None:
                 return
             lat, lng = float(lat), float(lng)
-            nav_tool.set_latest_gps(lat, lng)
+            heading = payload.get("heading")
+            if heading is not None:
+                try:
+                    heading = float(heading)
+                except (TypeError, ValueError):
+                    heading = None
+            nav_tool.set_latest_gps(lat, lng, heading)
             if nav_tool.session.active_route:
                 async def _process_gps():
                     try:
@@ -195,6 +206,23 @@ async def my_agent(ctx: agents.JobContext):
 
     room.on("data_received", _on_data_received)
     logger.info("Subscribed to room GPS data (topic=%s)", GPS_DATA_TOPIC)
+
+    def _on_participant_disconnected(participant):
+        """When the phone disconnects, leave the room so next connect gets a fresh agent."""
+        logger.info("Participant %s left; agent leaving room so next connect gets a new session", participant.identity)
+
+        async def _leave():
+            try:
+                await room.disconnect()
+            except Exception as e:
+                logger.debug("Agent room.disconnect: %s", e)
+
+        try:
+            asyncio.get_running_loop().create_task(_leave())
+        except RuntimeError:
+            pass
+
+    room.on("participant_disconnected", _on_participant_disconnected)
 
     async def say_greeting():
         """Ask where to go as soon as the session is ready (mic enabled)."""

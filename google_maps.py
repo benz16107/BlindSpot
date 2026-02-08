@@ -33,6 +33,7 @@ class NavigationTool:
             api_key = api_key.strip()
         self._latest_lat: Optional[float] = None
         self._latest_lng: Optional[float] = None
+        self._latest_heading: Optional[float] = None  # 0–360, 0=north (from phone compass)
         if not api_key:
             logger.warning("GOOGLE_MAPS_API_KEY not found or empty in environment")
             self.client = None
@@ -49,10 +50,12 @@ class NavigationTool:
         
         self.session = NavigationSession()
 
-    def set_latest_gps(self, lat: float, lng: float) -> None:
-        """Update latest GPS from phone (called when room receives data on topic gps)."""
+    def set_latest_gps(self, lat: float, lng: float, heading: Optional[float] = None) -> None:
+        """Update latest GPS and optional compass heading from phone (topic gps)."""
         self._latest_lat = lat
         self._latest_lng = lng
+        if heading is not None:
+            self._latest_heading = heading
 
     @llm.function_tool(description="Get the user's current location. Use when they ask 'where am I?' or 'what's my location?'. By default return only the address/place name from Google Maps. Set include_coordinates=True only when the user explicitly asks for coordinates or latitude/longitude.")
     async def get_current_location(self, include_coordinates: bool = False) -> str:
@@ -62,6 +65,26 @@ class NavigationTool:
 
         lat, lng = self._latest_lat, self._latest_lng
         coords_str = f"{lat:.6f}, {lng:.6f} (latitude, longitude)"
+
+        facing_str = ""
+        if self._latest_heading is not None:
+            h = self._latest_heading
+            if h < 22.5 or h >= 337.5:
+                facing_str = " Facing north."
+            elif h < 67.5:
+                facing_str = " Facing north-east."
+            elif h < 112.5:
+                facing_str = " Facing east."
+            elif h < 157.5:
+                facing_str = " Facing south-east."
+            elif h < 202.5:
+                facing_str = " Facing south."
+            elif h < 247.5:
+                facing_str = " Facing south-west."
+            elif h < 292.5:
+                facing_str = " Facing west."
+            else:
+                facing_str = " Facing north-west."
 
         if self.client:
             try:
@@ -73,12 +96,34 @@ class NavigationTool:
                     addr = results[0].get("formatted_address")
                     if isinstance(addr, str) and addr.strip():
                         if include_coordinates:
-                            return f"You are at {addr}. Coordinates: {coords_str}."
-                        return f"You are at {addr}."
+                            return f"You are at {addr}. Coordinates: {coords_str}.{facing_str}"
+                        return f"You are at {addr}.{facing_str}"
             except Exception as e:
                 logger.debug("Reverse geocode failed: %s", e)
 
-        return f"You are at coordinates {coords_str}."
+        return f"You are at coordinates {coords_str}.{facing_str}"
+
+    @llm.function_tool(description="Get the direction the user is facing (from phone compass). Use when they ask 'which way am I facing?', 'am I pointing north?', or 'where am I walking towards?'.")
+    async def get_heading(self) -> str:
+        """Return current compass heading (0–360°, 0=north) or that heading is not available."""
+        if self._latest_heading is None:
+            return "Compass heading is not available. Make sure the app is open and has compass access."
+        h = self._latest_heading
+        if h < 22.5 or h >= 337.5:
+            return "You are facing north."
+        if h < 67.5:
+            return "You are facing north-east."
+        if h < 112.5:
+            return "You are facing east."
+        if h < 157.5:
+            return "You are facing south-east."
+        if h < 202.5:
+            return "You are facing south."
+        if h < 247.5:
+            return "You are facing south-west."
+        if h < 292.5:
+            return "You are facing west."
+        return "You are facing north-west."
 
     @llm.function_tool(description="Start turn-by-turn navigation from an origin to a destination. Always use origin 'current location' unless the user explicitly gives a different start address (e.g. 'navigate me to X', 'take me to Y' → origin='current location', destination=X or Y).")
     async def start_navigation(self, origin: str, destination: str, mode: str = "walking") -> str:
@@ -259,7 +304,9 @@ class NavigationTool:
                 )
             return f"Error getting directions: {err_msg}"
 
-    @llm.function_tool(description="Search for a place or point of interest")
+    @llm.function_tool(
+        description="Search for a place or point of interest. When the user's location is known, results are biased nearby (use for 'nearby X', 'nearest Y'). Returned addresses can be used as destination in start_navigation."
+    )
     async def search_places(self, query: str) -> str:
         api_key = os.environ.get("GOOGLE_MAPS_API_KEY")
         if not api_key:
@@ -272,6 +319,14 @@ class NavigationTool:
             "X-Goog-FieldMask": "places.displayName,places.formattedAddress,places.rating",
         }
         payload = {"textQuery": query, "pageSize": 3}
+        if self._latest_lat is not None and self._latest_lng is not None:
+            payload["locationBias"] = {
+                "circle": {
+                    "center": {"latitude": self._latest_lat, "longitude": self._latest_lng},
+                    "radius": 5000.0,
+                }
+            }
+            payload["rankPreference"] = "DISTANCE"
 
         try:
             def _search():
@@ -310,3 +365,63 @@ class NavigationTool:
         except Exception as e:
             logger.error(f"Error searching places: {e}")
             return f"Error searching places: {str(e)}"
+
+    @llm.function_tool(
+        description="Find a nearby place and start turn-by-turn navigation to it. Use for requests like 'navigate to a nearby McDonald's', 'take me to the nearest coffee shop', 'find a pharmacy nearby and take me there'. Pass only the place type or name (e.g. 'McDonald's', 'coffee shop', 'pharmacy')."
+    )
+    async def navigate_to_nearby(self, place_query: str) -> str:
+        """Find the nearest place matching the query and start navigation to it."""
+        if not self.client:
+            return "Google Maps API key not configured."
+        if self._latest_lat is None or self._latest_lng is None:
+            return "I don't have your location yet. Make sure the app is open and GPS is on, then ask again."
+
+        api_key = os.environ.get("GOOGLE_MAPS_API_KEY")
+        if not api_key:
+            return "Google Maps API key not configured."
+
+        url = "https://places.googleapis.com/v1/places:searchText"
+        headers = {
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": api_key,
+            "X-Goog-FieldMask": "places.displayName,places.formattedAddress",
+        }
+        payload = {
+            "textQuery": (place_query or "").strip() or "place",
+            "pageSize": 1,
+            "locationBias": {
+                "circle": {
+                    "center": {"latitude": self._latest_lat, "longitude": self._latest_lng},
+                    "radius": 5000.0,
+                }
+            },
+            "rankPreference": "DISTANCE",
+        }
+        try:
+            def _search():
+                resp = requests.post(url, json=payload, headers=headers, timeout=10)
+                resp.raise_for_status()
+                return resp.json()
+
+            data = await asyncio.to_thread(_search)
+            places = data.get("places") or []
+            if not places:
+                return f"No nearby place found for '{place_query}'. Try a different search or area."
+
+            place = places[0]
+            name = "Unknown"
+            if place.get("displayName") and isinstance(place["displayName"].get("text"), str):
+                name = place["displayName"]["text"]
+            address = place.get("formattedAddress")
+            if not address or not isinstance(address, str) or not address.strip():
+                return f"Found {name} but could not get its address."
+            return await self.start_navigation(origin="current location", destination=address, mode="walking")
+        except requests.exceptions.HTTPError as e:
+            body = (e.response.text if e.response else "") or str(e)
+            logger.error(f"navigate_to_nearby search: {e.response.status_code} {body}")
+            if e.response and e.response.status_code == 403:
+                return "Places search failed: enable 'Places API (New)' in Google Cloud Console."
+            return f"Search failed: {body[:150]}"
+        except Exception as e:
+            logger.error(f"navigate_to_nearby: {e}")
+            return f"Could not find or navigate to nearby place: {str(e)}"
