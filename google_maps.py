@@ -197,7 +197,7 @@ class NavigationTool:
 
             self.session.start_route(selected_route, destination)
 
-            # Total distance, duration, and arrival time from all legs
+            # Total distance, duration, and arrival time from all legs (announce these before any directions)
             legs = selected_route.get("legs", [])
             total_meters = 0
             total_seconds = 0
@@ -215,14 +215,22 @@ class NavigationTool:
                 arrival_str = (arrival.strftime("%I:%M %p").lstrip("0") if arrival else "N/A")
             except Exception:
                 arrival_str = "N/A"
-            # Announce trip summary first (distance, time, arrival), then first direction
-            summary = f"Your trip: total distance {distance_text}, estimated time {duration_text}, arrival around {arrival_str}.{analysis_text} "
+            # Confirm destination first, then total distance, time, arrival, then first direction.
+            end_address = legs[0].get("end_address", destination) if legs else destination
+            destination_confirm = f"Destination: {end_address}. "
+            summary_announcement = (
+                f"Total distance: {distance_text}. "
+                f"Estimated time: {duration_text}. "
+                f"Arrival around {arrival_str}."
+            )
+            if analysis_text:
+                summary_announcement += " " + analysis_text.strip()
             if legs:
                 steps = legs[0].get("steps", [])
                 if steps:
                     first_instruction = self.session._clean_instruction(steps[0].get('html_instructions', 'Proceed to route'))
-                    return f"Navigation started. {summary}First direction: {first_instruction}"
-            return f"Navigation started. {summary}Proceed to the route."
+                    return f"{destination_confirm}{summary_announcement} First direction: {first_instruction}"
+            return f"{destination_confirm}{summary_announcement} Proceed to the route."
             
         except Exception as e:
             err_msg = str(e)
@@ -305,7 +313,7 @@ class NavigationTool:
             return f"Error getting directions: {err_msg}"
 
     @llm.function_tool(
-        description="Search for a place or point of interest. When the user's location is known, results are biased nearby (use for 'nearby X', 'nearest Y'). Returned addresses can be used as destination in start_navigation."
+        description="Search for places matching a query (e.g. 'coffee shop', 'pharmacy'). Returns a numbered list of up to 3 nearby places with name and address. Use this FIRST when the user asks for a generic destination like 'a coffee shop' or 'a pharmacy' so they can pick which one to go to; then call start_navigation with the chosen place's address."
     )
     async def search_places(self, query: str) -> str:
         api_key = os.environ.get("GOOGLE_MAPS_API_KEY")
@@ -339,8 +347,8 @@ class NavigationTool:
             if not places:
                 return "No places found."
 
-            response_text = f"Found {len(places)} places (showing top 3):\n"
-            for place in places[:3]:
+            response_text = f"Found {len(places)} places (showing top 3). Tell the user and ask which one to navigate to:\n"
+            for i, place in enumerate(places[:3], 1):
                 name = "Unknown"
                 if place.get("displayName") and isinstance(place["displayName"].get("text"), str):
                     name = place["displayName"]["text"]
@@ -348,7 +356,7 @@ class NavigationTool:
                 rating = place.get("rating", "N/A")
                 if isinstance(rating, (int, float)):
                     rating = str(rating)
-                response_text += f"- {name}: {address} (Rating: {rating})\n"
+                response_text += f"{i}. {name} at {address} (Rating: {rating})\n"
             return response_text
 
         except requests.exceptions.HTTPError as e:

@@ -5,6 +5,7 @@ import 'dart:math' as math;
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+import 'package:flutter/semantics.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_compass/flutter_compass.dart';
 import 'package:geolocator/geolocator.dart';
@@ -112,7 +113,14 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
       }
       return;
     }
-    if (mounted) setState(() => _voiceConnecting = false);
+    if (mounted) {
+      setState(() => _voiceConnecting = false);
+      _announceToScreenReader(
+        _voiceService.isConnected
+            ? 'Voice agent connected. Say where you want to go or ask where you are.'
+            : 'Voice agent disconnected.',
+      );
+    }
   }
 
   Future<void> _start() async {
@@ -306,10 +314,20 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
     if (_obstacleDetectionOn) {
       setState(() => _obstacleDetectionOn = false);
       _stopObstacleDetection();
+      _announceToScreenReader('Object detection turned off.');
     } else {
       if (!_voiceService.isConnected) return;
       setState(() => _obstacleDetectionOn = true);
       _startObstacleDetection();
+      _announceToScreenReader('Object detection turned on. You will feel vibrations and hear alerts when something is in front.');
+    }
+  }
+
+  void _announceToScreenReader(String message) {
+    try {
+      SemanticsService.announce(message, TextDirection.ltr);
+    } catch (_) {
+      // Announce not supported on this platform
     }
   }
 
@@ -518,6 +536,45 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
         "(±${p.accuracy.toStringAsFixed(0)}m)";
   }
 
+  String _headingLabel(double heading) {
+    final deg = heading.round() % 360;
+    final dir = deg >= 337.5 || deg < 22.5
+        ? 'north'
+        : deg >= 22.5 && deg < 67.5
+            ? 'north-east'
+            : deg >= 67.5 && deg < 112.5
+                ? 'east'
+                : deg >= 112.5 && deg < 157.5
+                    ? 'south-east'
+                    : deg >= 157.5 && deg < 202.5
+                        ? 'south'
+                        : deg >= 202.5 && deg < 247.5
+                            ? 'south-west'
+                            : deg >= 247.5 && deg < 292.5
+                                ? 'west'
+                                : 'north-west';
+    return 'Facing $dir. $deg degrees.';
+  }
+
+  /// Single-sentence summary for screen reader (status card).
+  String _statusSummaryForAccessibility() {
+    final parts = <String>[_status, _locationLine()];
+    if (_obstacleNear && _obstacleDescription != null) {
+      parts.add('Obstacle in front: $_obstacleDescription');
+    }
+    if (_voiceError != null) {
+      parts.add('Voice error: $_voiceError');
+    } else if (_voiceConnecting) {
+      parts.add('Voice: connecting');
+    } else if (_voiceService.isConnected) {
+      parts.add('Voice agent: on');
+    } else {
+      parts.add('Voice agent: off');
+    }
+    parts.add(_obstacleDetectionOn ? 'Object detection: on' : 'Object detection: off');
+    return parts.join('. ');
+  }
+
   @override
   Widget build(BuildContext context) {
     final controller = _controller;
@@ -535,27 +592,33 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                 children: [
                   Positioned.fill(
                     child: showCamera
-                        ? _CameraPreviewFullScreen(controller: controller)
+                        ? ExcludeSemantics(
+                            child: _CameraPreviewFullScreen(controller: controller),
+                          )
                         : Container(color: Colors.black87, child: Center(child: Text(_status, style: const TextStyle(color: Colors.white54)))),
                   ),
 
-                  // Status + GPS overlay
+                  // Status + GPS overlay (semantic summary for screen reader)
                   Positioned(
                     left: 12,
                     right: 12,
                     top: 12,
-                    child: Container(
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: Colors.black.withOpacity(0.55),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(_status, style: const TextStyle(color: Colors.white)),
-                          const SizedBox(height: 6),
-                          Text(_locationLine(), style: const TextStyle(color: Colors.white)),
+                    child: Semantics(
+                      container: true,
+                      label: _statusSummaryForAccessibility(),
+                      child: Container(
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withOpacity(0.7),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: Colors.white24, width: 1),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(_status, style: const TextStyle(color: Colors.white, fontSize: 15)),
+                            const SizedBox(height: 6),
+                            Text(_locationLine(), style: const TextStyle(color: Colors.white70, fontSize: 14)),
                           if (_obstacleNear && _obstacleDescription != null) ...[
                             const SizedBox(height: 4),
                             Row(
@@ -608,11 +671,26 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                     style: const TextStyle(color: Colors.white70, fontSize: 12),
                                   ),
                                   const SizedBox(width: 8),
-                                  GestureDetector(
-                                    onTap: _stopMicTest,
-                                    child: Text(
-                                      'Stop',
-                                      style: TextStyle(color: Colors.orange.shade200, fontSize: 12),
+                                  Semantics(
+                                    label: 'Stop mic test',
+                                    hint: 'Double tap to stop listening',
+                                    button: true,
+                                    child: GestureDetector(
+                                      onTap: _stopMicTest,
+                                      behavior: HitTestBehavior.opaque,
+                                      child: Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                                        constraints: const BoxConstraints(minHeight: 48),
+                                        alignment: Alignment.center,
+                                        decoration: BoxDecoration(
+                                          color: Colors.orange.shade700,
+                                          borderRadius: BorderRadius.circular(8),
+                                        ),
+                                        child: Text(
+                                          'Stop',
+                                          style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w600),
+                                        ),
+                                      ),
                                     ),
                                   ),
                                 ],
@@ -623,21 +701,29 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                 style: TextStyle(color: Colors.white54, fontSize: 11),
                               ),
                             ] else if (!_voiceService.isConnected && !_voiceConnecting) ...[
-                              GestureDetector(
-                                onTap: _startMicTest,
-                                child: Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                                  decoration: BoxDecoration(
-                                    color: Colors.white24,
-                                    borderRadius: BorderRadius.circular(8),
-                                  ),
-                                  child: const Row(
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      Icon(Icons.mic_none, size: 18, color: Colors.white70),
-                                      SizedBox(width: 6),
-                                      Text('Test mic level', style: TextStyle(color: Colors.white70, fontSize: 12)),
-                                    ],
+                              Semantics(
+                                label: 'Test mic level',
+                                hint: 'Double tap to test your microphone before connecting',
+                                button: true,
+                                child: GestureDetector(
+                                  onTap: _startMicTest,
+                                  behavior: HitTestBehavior.opaque,
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                                    constraints: const BoxConstraints(minHeight: 48),
+                                    decoration: BoxDecoration(
+                                      color: Colors.white24,
+                                      borderRadius: BorderRadius.circular(8),
+                                      border: Border.all(color: Colors.white38),
+                                    ),
+                                    child: const Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Icon(Icons.mic_none, size: 22, color: Colors.white),
+                                        SizedBox(width: 10),
+                                        Text('Test mic level', style: TextStyle(color: Colors.white, fontSize: 15)),
+                                      ],
+                                    ),
                                   ),
                                 ),
                               ),
@@ -698,22 +784,33 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                 ),
                               ],
                               const SizedBox(height: 6),
-                              GestureDetector(
-                                onTap: () async {
-                                  HapticFeedback.selectionClick();
-                                  await _voiceService.playbackAudio();
-                                },
-                                child: Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                                  decoration: BoxDecoration(
-                                    color: Colors.orange.withOpacity(0.9),
-                                    borderRadius: BorderRadius.circular(8),
-                                  ),
-                                  child: Text(
-                                    _voiceService.audioPlaybackFailed
-                                        ? 'Tap to enable speaker (Chrome)'
-                                        : 'Tap to enable speaker',
-                                    style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w500),
+                              Semantics(
+                                label: _voiceService.audioPlaybackFailed
+                                    ? 'Tap to enable speaker. Required in Chrome to hear the agent.'
+                                    : 'Tap to enable speaker',
+                                hint: 'Double tap to unlock audio playback',
+                                button: true,
+                                child: GestureDetector(
+                                  onTap: () async {
+                                    HapticFeedback.selectionClick();
+                                    await _voiceService.playbackAudio();
+                                  },
+                                  behavior: HitTestBehavior.opaque,
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                                    constraints: const BoxConstraints(minHeight: 48),
+                                    alignment: Alignment.center,
+                                    decoration: BoxDecoration(
+                                      color: Colors.orange.shade700,
+                                      borderRadius: BorderRadius.circular(8),
+                                      border: Border.all(color: Colors.white24),
+                                    ),
+                                    child: Text(
+                                      _voiceService.audioPlaybackFailed
+                                          ? 'Tap to enable speaker (Chrome)'
+                                          : 'Tap to enable speaker',
+                                      style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w600),
+                                    ),
                                   ),
                                 ),
                               ),
@@ -722,46 +819,133 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                         ],
                       ),
                     ),
+                    ),
                   ),
 
-                  // Compass: direction you're facing (N/S/E/W)
+                  // Compass: direction you're facing (above the bottom button strip)
                   if (_heading != null)
                     Positioned(
                       left: 12,
-                      bottom: 12,
-                      child: _CompassWidget(heading: _heading!),
+                      bottom: 130,
+                      child: Semantics(
+                        label: _headingLabel(_heading!),
+                        container: true,
+                        child: _CompassWidget(heading: _heading!),
+                      ),
                     ),
 
-                  // Object detection + Voice agent: two FABs side by side
+                  // Primary actions: Voice + Object detection (large, high-contrast, screen-reader friendly)
                   Positioned(
-                    right: 12,
-                    bottom: 12,
+                    left: 16,
+                    right: 16,
+                    bottom: 16,
                     child: Row(
-                      mainAxisSize: MainAxisSize.min,
                       children: [
-                        // Object detection: only when voice is on; within 5 m and directly in front
-                        FloatingActionButton(
-                          heroTag: 'obstacle',
-                          onPressed: _voiceService.isConnected ? _onObstacleDetectionToggle : null,
-                          backgroundColor: _obstacleDetectionOn ? Colors.orange : null,
-                          child: Icon(
-                            Icons.warning_amber_rounded,
-                            color: _obstacleDetectionOn ? Colors.white : (_voiceService.isConnected ? null : Colors.white38),
+                        // Object detection (only when voice is on)
+                        Expanded(
+                          child: Semantics(
+                            label: _voiceService.isConnected
+                                ? (_obstacleDetectionOn
+                                    ? 'Object detection. On. Double tap to turn off.'
+                                    : 'Object detection. Off. Double tap to turn on.')
+                                : 'Object detection. Connect voice first.',
+                            hint: _voiceService.isConnected ? 'Double tap to toggle obstacle alerts' : null,
+                            button: true,
+                            enabled: _voiceService.isConnected,
+                            child: Material(
+                              color: _voiceService.isConnected
+                                  ? (_obstacleDetectionOn ? Colors.orange.shade700 : Colors.grey.shade800)
+                                  : Colors.grey.shade900,
+                              borderRadius: BorderRadius.circular(12),
+                              child: InkWell(
+                                onTap: _voiceService.isConnected ? _onObstacleDetectionToggle : null,
+                                borderRadius: BorderRadius.circular(12),
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(vertical: 18),
+                                  alignment: Alignment.center,
+                                  child: Row(
+                                    mainAxisAlignment: MainAxisAlignment.center,
+                                    children: [
+                                      Icon(
+                                        Icons.warning_amber_rounded,
+                                        size: 28,
+                                        color: _voiceService.isConnected
+                                            ? (_obstacleDetectionOn ? Colors.white : Colors.white70)
+                                            : Colors.white38,
+                                      ),
+                                      const SizedBox(width: 10),
+                                      Text(
+                                        'Obstacles',
+                                        style: TextStyle(
+                                          fontSize: 18,
+                                          fontWeight: FontWeight.w600,
+                                          color: _voiceService.isConnected
+                                              ? (_obstacleDetectionOn ? Colors.white : Colors.white70)
+                                              : Colors.white38,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ),
                           ),
                         ),
                         const SizedBox(width: 12),
-                        // Voice agent toggle: on = connect (mic + GPS), off = disconnect (memory kept)
-                        FloatingActionButton(
-                          heroTag: 'mic',
-                          onPressed: _voiceConnecting ? null : _onVoiceButtonPressed,
-                          backgroundColor: _voiceService.isConnected ? Colors.green : null,
-                          child: _voiceConnecting
-                              ? const SizedBox(
-                                  width: 24,
-                                  height: 24,
-                                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                                )
-                              : const Icon(Icons.mic),
+                        // Voice agent toggle
+                        Expanded(
+                          child: Semantics(
+                            label: _voiceConnecting
+                                ? 'Voice agent. Connecting.'
+                                : (_voiceService.isConnected
+                                    ? 'Voice agent. On. Double tap to disconnect.'
+                                    : 'Voice agent. Off. Double tap to connect.'),
+                            hint: _voiceConnecting ? null : 'Double tap to turn voice assistant on or off',
+                            button: true,
+                            enabled: !_voiceConnecting,
+                            child: Material(
+                              color: _voiceConnecting
+                                  ? Colors.grey.shade700
+                                  : (_voiceService.isConnected ? Colors.green.shade700 : Colors.grey.shade800),
+                              borderRadius: BorderRadius.circular(12),
+                              child: InkWell(
+                                onTap: _voiceConnecting ? null : _onVoiceButtonPressed,
+                                borderRadius: BorderRadius.circular(12),
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(vertical: 18),
+                                  alignment: Alignment.center,
+                                  child: _voiceConnecting
+                                      ? const SizedBox(
+                                          width: 28,
+                                          height: 28,
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 3,
+                                            color: Colors.white,
+                                          ),
+                                        )
+                                      : Row(
+                                          mainAxisAlignment: MainAxisAlignment.center,
+                                          children: [
+                                            Icon(
+                                              Icons.mic,
+                                              size: 28,
+                                              color: _voiceService.isConnected ? Colors.white : Colors.white70,
+                                            ),
+                                            const SizedBox(width: 10),
+                                            Text(
+                                              'Voice',
+                                              style: TextStyle(
+                                                fontSize: 18,
+                                                fontWeight: FontWeight.w600,
+                                                color: _voiceService.isConnected ? Colors.white : Colors.white70,
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                ),
+                              ),
+                            ),
+                          ),
                         ),
                       ],
                     ),
