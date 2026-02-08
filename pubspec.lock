@@ -146,7 +146,7 @@ packages:
     source: hosted
     version: "3.0.7"
   dart_jsonwebtoken:
-    dependency: transitive
+    dependency: "direct main"
     description:
       name: dart_jsonwebtoken
       sha256: "0de65691c1d736e9459f22f654ddd6fd8368a271d4e41aa07e53e6301eff5075"
@@ -259,6 +259,14 @@ packages:
     description: flutter
     source: sdk
     version: "0.0.0"
+  flutter_tts:
+    dependency: "direct main"
+    description:
+      name: flutter_tts
+      sha256: ce5eb209b40e95f2f4a1397116c87ab2fcdff32257d04ed7a764e75894c03775
+      url: "https://pub.dev"
+    source: hosted
+    version: "4.2.5"
   flutter_web_plugins:
     dependency: transitive
     description: flutter
@@ -328,6 +336,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "2.1.3"
+  google_generative_ai:
+    dependency: "direct main"
+    description:
+      name: google_generative_ai
+      sha256: "71f613d0247968992ad87a0eb21650a566869757442ba55a31a81be6746e0d1f"
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.4.7"
   hooks:
     dependency: transitive
     description:

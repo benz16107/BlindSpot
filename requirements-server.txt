@@ -1,4 +1,0 @@
-# Minimal deps for server.py (token + obstacle). Use: pip install -r requirements-server.txt
-livekit-api>=1.1.0
-google-genai>=0.4.0
-python-dotenv>=1.2.0

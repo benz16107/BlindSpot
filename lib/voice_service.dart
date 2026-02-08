@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:dart_jsonwebtoken/dart_jsonwebtoken.dart';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:livekit_client/livekit_client.dart';
@@ -18,6 +19,7 @@ class VoiceService extends ChangeNotifier {
   EventsListener<RoomEvent>? _roomListener;
 
   static const String _gpsTopic = 'gps';
+  static const String _obstacleTopic = 'obstacle';
   static const Duration _gpsInterval = Duration(seconds: 3);
 
   bool get isConnected => _room != null;
@@ -35,21 +37,53 @@ class VoiceService extends ChangeNotifier {
 
   bool _disconnecting = false;
 
+  /// Generate a LiveKit JWT in-app (no token server). Requires [liveKitUrl], [liveKitApiKey], [liveKitApiSecret] in config.
+  String _makeLiveKitToken(String identity, String roomName) {
+    final jwt = JWT(
+      {
+        'video': {
+          'room': roomName,
+          'roomJoin': true,
+          'canPublish': true,
+          'canSubscribe': true,
+          'canPublishData': true,
+        },
+      },
+      subject: identity,
+      issuer: liveKitApiKey.trim(),
+    );
+    return jwt.sign(
+      SecretKey(liveKitApiSecret.trim()),
+      algorithm: JWTAlgorithm.HS256,
+      expiresIn: const Duration(hours: 24),
+    );
+  }
+
   /// Connect to the voice agent (publish mic; start sending GPS). Memory from previous sessions is preserved on the server.
-  /// [tokenUrlOverride] Use this on a physical device to point to your computer's IP (e.g. http://192.168.1.100:8765/token).
-  /// Uses a unique identity per connection so turning mic off and on again starts a fresh agent session.
+  /// If [useLocalLiveKitToken] is true (LiveKit URL + API key + secret in config), generates token in-app — no token server.
+  /// Otherwise [tokenUrlOverride] or [tokenUrl] is used to fetch token (e.g. http://YOUR_COMPUTER_IP:8765/token).
   Future<void> connect({String? tokenUrlOverride}) async {
     if (_room != null) return;
     while (_disconnecting) {
       await Future<void>.delayed(const Duration(milliseconds: 50));
     }
 
-    final tokenServerUrl = (tokenUrlOverride ?? tokenUrl).trim();
-    if (tokenServerUrl.isEmpty) {
-      throw Exception('Token server URL not set. Set it in the app (e.g. http://YOUR_COMPUTER_IP:8765/token).');
-    }
+    String token;
+    String url;
 
-    try {
+    if (useLocalLiveKitToken) {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final identity = 'mobile-user-$now';
+      final roomName = 'voice-nav-$now';
+      token = _makeLiveKitToken(identity, roomName);
+      url = liveKitUrl.trim();
+      if (url.startsWith('http://')) url = 'ws${url.substring(4)}';
+      if (url.startsWith('https://')) url = 'wss${url.substring(5)}';
+    } else {
+      final tokenServerUrl = (tokenUrlOverride ?? tokenUrl).trim();
+      if (tokenServerUrl.isEmpty) {
+        throw Exception('Token server URL not set. Set it in the app (e.g. http://YOUR_COMPUTER_IP:8765/token).');
+      }
       final now = DateTime.now().millisecondsSinceEpoch;
       final identity = 'mobile-user-$now';
       final roomName = 'voice-nav-$now';
@@ -61,12 +95,16 @@ class VoiceService extends ChangeNotifier {
         throw Exception('Token failed: ${resp.statusCode} ${resp.body}');
       }
       final body = jsonDecode(resp.body) as Map<String, dynamic>;
-      final token = body['token'] as String?;
-      final url = body['url'] as String?;
-      if (token == null || token.isEmpty || url == null || url.isEmpty) {
+      final t = body['token'] as String?;
+      final u = body['url'] as String?;
+      if (t == null || t.isEmpty || u == null || u.isEmpty) {
         throw Exception('Invalid token response: missing token or url');
       }
+      token = t;
+      url = u;
+    }
 
+    try {
       final room = Room();
       _setUpRoomListeners(room);
       // Publish mic from the start; unique room per connect so each reconnect gets a new agent (Android closes connection if we add track later)
@@ -160,6 +198,18 @@ class VoiceService extends ChangeNotifier {
       room.localParticipant?.publishData(utf8.encode(payloadStr), topic: _gpsTopic);
     } catch (e) {
       debugPrint('VoiceService GPS publish: $e');
+    }
+  }
+
+  /// Notify the voice agent that obstacle detection found something (agent can warn user by voice).
+  void publishObstacleDetected(String description) {
+    final room = _room;
+    if (room == null) return;
+    try {
+      final payload = jsonEncode({'obstacle': description, 'ts': DateTime.now().millisecondsSinceEpoch});
+      room.localParticipant?.publishData(utf8.encode(payload), topic: _obstacleTopic);
+    } catch (e) {
+      debugPrint('VoiceService obstacle publish: $e');
     }
   }
 
