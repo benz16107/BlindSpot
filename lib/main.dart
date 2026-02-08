@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
 
 Future<void> main() async {
@@ -40,6 +41,11 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
   StreamSubscription<Position>? _posSub;
   Position? _pos;
   String? _locError;
+
+  // Haptic feedback state
+  Timer? _hapticTimer;
+  DateTime? _lastHapticTime;
+  bool _justVibrated = false;
 
   @override
   void initState() {
@@ -144,6 +150,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
         (p) {
           if (!mounted) return;
           setState(() => _pos = p);
+          _handleHapticFeedback(p);
         },
         onError: (e) {
           if (!mounted) return;
@@ -152,6 +159,9 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
           });
         },
       );
+
+      // Start haptic feedback timer (checks every 3 seconds if moving)
+      _startHapticTimer();
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -161,9 +171,44 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
     }
   }
 
+  void _startHapticTimer() {
+    _hapticTimer?.cancel();
+    _hapticTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+      if (_pos != null && _pos!.speed > 0.5) {
+        _triggerHaptic();
+      }
+    });
+  }
+
+  void _handleHapticFeedback(Position position) {
+    // Check if we should vibrate based on rate limiting
+    if (position.speed > 0.5) {
+      final now = DateTime.now();
+      if (_lastHapticTime == null ||
+          now.difference(_lastHapticTime!).inSeconds >= 3) {
+        _triggerHaptic();
+        _lastHapticTime = now;
+      }
+    }
+  }
+
+  Future<void> _triggerHaptic() async {
+    try {
+      await HapticFeedback.mediumImpact();
+      // Visual indicator (flashes for debugging)
+      setState(() => _justVibrated = true);
+      Future.delayed(const Duration(milliseconds: 100), () {
+        if (mounted) setState(() => _justVibrated = false);
+      });
+    } catch (e) {
+      // Silently handle haptic errors
+    }
+  }
+
   @override
   void dispose() {
     _posSub?.cancel();
+    _hapticTimer?.cancel();
     _controller?.dispose();
     super.dispose();
   }
@@ -172,8 +217,10 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
     if (_locError != null) return "GPS: $_locError";
     if (_pos == null) return "GPS: acquiring…";
     final p = _pos!;
-    return "GPS: ${p.latitude.toStringAsFixed(6)}, ${p.longitude.toStringAsFixed(6)} "
-        "(±${p.accuracy.toStringAsFixed(0)}m)";
+    final speedMsFormatted = p.speed.toStringAsFixed(2);
+    final isMoving = p.speed > 0.5 ? "🚶 Walking" : "⏸ Stopped";
+    return "📍 ${p.latitude.toStringAsFixed(6)}, ${p.longitude.toStringAsFixed(6)}\n"
+        "📏 ±${p.accuracy.toStringAsFixed(0)}m  |  ${isMoving} ($speedMsFormatted m/s)";
   }
 
   @override
@@ -200,29 +247,47 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                     child: Container(
                       padding: const EdgeInsets.all(12),
                       decoration: BoxDecoration(
-                        color: Colors.black.withOpacity(0.55),
+                        color: _justVibrated
+                            ? Colors.green.withOpacity(0.7)
+                            : Colors.black.withOpacity(0.65),
                         borderRadius: BorderRadius.circular(12),
+                        border: _locError != null
+                            ? Border.all(color: Colors.red, width: 2)
+                            : null,
                       ),
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text(_status, style: const TextStyle(color: Colors.white)),
-                          const SizedBox(height: 6),
-                          Text(_locationLine(), style: const TextStyle(color: Colors.white)),
+                          if (_locError != null)
+                            Text(
+                              "⚠ GPS: $_locError",
+                              style: const TextStyle(
+                                color: Colors.yellow,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 14,
+                              ),
+                            )
+                          else
+                            Text(
+                              _status,
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 13,
+                              ),
+                            ),
+                          const SizedBox(height: 8),
+                          Text(
+                            _locationLine(),
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 12,
+                              fontFamily: 'monospace',
+                            ),
+                          ),
                         ],
                       ),
                     ),
                   ),
-
-                  // (Optional) button to copy lat/lng later
-                  // Positioned(
-                  //   right: 12,
-                  //   bottom: 12,
-                  //   child: FloatingActionButton(
-                  //     onPressed: () {},
-                  //     child: const Icon(Icons.my_location),
-                  //   ),
-                  // ),
                 ],
               ),
       ),
