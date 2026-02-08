@@ -57,8 +57,17 @@ const double obstacleTemperature = 0.2;
 /// HTTP/timeout for obstacle request (seconds).
 const int obstacleRequestTimeoutSeconds = 8;
 
-/// How often to run obstacle check (seconds between frames).
-const int obstacleCheckIntervalSeconds = 1;
+/// How often to run obstacle check (milliseconds). Lower = faster updates, more API use (e.g. 400–600).
+const int obstacleCheckIntervalMs = 500;
+
+/// Max width for image sent to Gemini. Smaller = faster upload and inference (e.g. 256).
+const int obstacleImageMaxWidth = 256;
+
+/// JPEG quality when resizing (1–100). Lower = smaller payload.
+const int obstacleJpegQuality = 65;
+
+/// Cap output tokens so the model returns quickly.
+const int obstacleMaxOutputTokens = 64;
 
 /// Minimum time between repeated voice announcements for the same obstacle (seconds).
 const int obstacleAnnounceCooldownSeconds = 4;
@@ -69,20 +78,7 @@ const int obstacleHapticPeriodMs = 350;
 /// Distance values that trigger alert (e.g. ['near', 'medium'] = alert within ~5 m).
 const List<String> obstacleAlertDistances = ['near', 'medium'];
 
-/// System prompt sent to Gemini for each camera frame. Change rules and distance wording here.
-const String obstaclePrompt = r'''
-You are analyzing a single JPEG image from a smartphone's BACK CAMERA held by a blind pedestrian.
-
-RULES — only alert when BOTH conditions are met:
-1. The object is DIRECTLY in front: in the center of the frame (middle third of the image, especially lower center). If it is to the left or right of center, say obstacle_detected false.
-2. The object is within about 5 meters: use "near" for within ~2 m (very close), "medium" for ~2–5 m. If it appears farther than 5 m (small in frame), say obstacle_detected false and distance "none" or "far".
-
-- "obstacle_detected": true ONLY when the object is centered AND within ~5 m. Otherwise false.
-- "distance": "near" when within ~2 m and centered; "medium" when ~2–5 m and centered. Use "none" or "far" when beyond 5 m and set obstacle_detected to false.
-- Do NOT report: ground, sky, pavement, things to the side, or anything farther than ~5 m. When in doubt, say false (fewer false alarms).
-
-Reply with JSON only, no other text, with these exact keys:
-- "obstacle_detected": true or false
-- "distance": one of "none", "far", "medium", "near"
-- "description": short phrase (e.g. "pole", "person") or empty if none
-''';
+/// Short prompt for low latency. Model returns JSON only.
+const String obstaclePrompt = r'''Phone back camera, blind pedestrian. JSON only.
+Rule: obstacle_detected true only if object in center and close. "near"=very close, "medium"=2–5 m. Else false, "far"/"none". Ignore ground/sky/sides.
+Keys: "obstacle_detected" (bool), "distance" ("none"|"far"|"medium"|"near"), "description" (short or "").''';

@@ -17,6 +17,7 @@ import 'config.dart';
 import 'voice_service.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:google_generative_ai/google_generative_ai.dart';
+import 'package:image/image.dart' as img;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -83,6 +84,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
   String? _obstacleDescription;
   DateTime? _lastObstacleAnnounceTime; // TTS cooldown
   final FlutterTts _tts = FlutterTts();
+  GenerativeModel? _obstacleModel; // cached for speed
 
   @override
   void initState() {
@@ -266,7 +268,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
 
   void _startObstacleDetection() {
     _obstacleTimer?.cancel();
-    final interval = Duration(seconds: obstacleCheckIntervalSeconds);
+    final interval = Duration(milliseconds: obstacleCheckIntervalMs);
     _obstacleTimer = Timer.periodic(interval, (_) => _runObstacleCheck());
     _runObstacleCheck(); // run first check immediately
   }
@@ -338,8 +340,10 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
 
     try {
       final xfile = await controller.takePicture();
-      final bytes = await xfile.readAsBytes();
+      List<int> bytes = await xfile.readAsBytes();
       if (!mounted || bytes.isEmpty) return;
+
+      bytes = _resizeObstacleImage(bytes);
 
       Map<String, dynamic>? body;
       if (useLocalObstacleDetection && googleApiKey.trim().isNotEmpty) {
@@ -407,18 +411,33 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
     }
   }
 
-  /// Call Gemini API directly from the app (no obstacle server). Uses [googleApiKey] from config.
+  /// Resize JPEG for fast upload and inference.
+  List<int> _resizeObstacleImage(List<int> imageBytes) {
+    if (obstacleImageMaxWidth <= 0) return imageBytes;
+    try {
+      final decoded = img.decodeImage(Uint8List.fromList(imageBytes));
+      if (decoded == null || decoded.width <= obstacleImageMaxWidth) return imageBytes;
+      final resized = img.copyResize(decoded, width: obstacleImageMaxWidth);
+      final encoded = img.encodeJpg(resized, quality: obstacleJpegQuality);
+      return encoded;
+    } catch (_) {
+      return imageBytes;
+    }
+  }
+
+  /// Call Gemini API directly from the app (no obstacle server). Model cached for speed.
   Future<Map<String, dynamic>?> _analyzeObstacleLocal(List<int> imageBytes) async {
     try {
-      final model = GenerativeModel(
+      _obstacleModel ??= GenerativeModel(
         model: obstacleModel,
         apiKey: googleApiKey.trim(),
         generationConfig: GenerationConfig(
           responseMimeType: 'application/json',
           temperature: obstacleTemperature,
+          maxOutputTokens: obstacleMaxOutputTokens,
         ),
       );
-      final response = await model.generateContent([
+      final response = await _obstacleModel!.generateContent([
         Content.multi([
           DataPart('image/jpeg', Uint8List.fromList(imageBytes)),
           TextPart(obstaclePrompt),
