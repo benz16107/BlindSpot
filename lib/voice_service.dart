@@ -153,7 +153,7 @@ class VoiceService extends ChangeNotifier {
             await event.track.enable();
             await room.startAudio();
             // Give Chrome a moment to attach the element, then try again (helps if first play() was blocked)
-            await Future<void>.delayed(const Duration(milliseconds: 300));
+            await Future<void>.delayed(const Duration(milliseconds: 150));
             await room.startAudio();
           } catch (e) {
             debugPrint('VoiceService TrackSubscribed startAudio: $e');
@@ -226,7 +226,7 @@ class VoiceService extends ChangeNotifier {
     _audioPlaybackFailed = false;
     try {
       await room.disconnect();
-      await Future<void>.delayed(const Duration(milliseconds: 600));
+      await Future<void>.delayed(const Duration(milliseconds: 300));
     } finally {
       _disconnecting = false;
     }

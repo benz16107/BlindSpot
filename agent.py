@@ -21,10 +21,11 @@ from livekit.plugins import (
 )
 from google.genai import types
 
-# from mcp_client import MCPServerSse
-from mcp_client import MCPServerHttp, MCPToolsIntegration   # or MCPServerStreamableHttp
+from mcp_client import MCPServerHttp, MCPToolsIntegration
 from backboard_store import init_backboard
 from google_maps import NavigationTool, GPS_DATA_TOPIC
+
+import agent_config as cfg
 
 OBSTACLE_DATA_TOPIC = "obstacle"
 
@@ -52,43 +53,34 @@ async def my_agent(ctx: agents.JobContext):
         # Continue without memory - voice still works
         memory_manager = None
     
-    # 2. Load thread history (keep small for low latency)
+    # 2. Load thread history (from agent_config)
     context_text = ""
     if memory_manager:
-        thread_history = await memory_manager.load_thread_history(limit=20)
+        thread_history = await memory_manager.load_thread_history(limit=cfg.MEMORY_HISTORY_LIMIT)
         context_text = memory_manager.format_context_for_llm(thread_history)
         logger.debug(f"Loaded context: {len(thread_history)} messages, {len(context_text)} chars")
 
-    # 3. Short instructions = faster first token; thinking off = much lower latency
-    base_instructions = (
-        "You are a concise voice walking navigation assistant for blind users. Multilingual. "
-        "Phone sends live GPS. Use get_current_location for 'where am I?'. "
-        "For 'navigate to X' or 'take me to Y' (with a specific address or place name) use start_navigation(origin='current location', destination=X or Y). Never ask for start address. "
-        "For 'navigate to a nearby X', 'nearest Y', 'find a Z and take me there' use navigate_to_nearby(place_query) with just the place type (e.g. 'McDonald's', 'coffee shop', 'pharmacy') — do NOT use start_navigation with a vague destination like 'nearby McDonald's'. "
-        "Turn-by-turn is automatic from GPS. Use Zapier tools when relevant. Keep replies brief."
-    )
-    full_instructions = f"{base_instructions}\n\n{context_text}".strip() if context_text else base_instructions
+    # 3. Instructions from agent_config
+    full_instructions = f"{cfg.AGENT_BASE_INSTRUCTIONS}\n\n{context_text}".strip() if context_text else cfg.AGENT_BASE_INSTRUCTIONS
 
-    # Voice pipeline: Deepgram STT + Gemini (no thinking for speed) + ElevenLabs TTS
-    # Set ELEVEN_API_KEY in .env.local (required). Optional: ELEVEN_VOICE_ID, ELEVEN_MODEL
     eleven_key = os.environ.get("ELEVEN_API_KEY", "").strip()
     if not eleven_key:
         logger.warning("ELEVEN_API_KEY is not set; ElevenLabs TTS will fail (no audio frames)")
     session = AgentSession(
-        stt=deepgram.STT(model="nova-2", language="en"),
+        stt=deepgram.STT(model=cfg.STT_MODEL, language=cfg.STT_LANGUAGE),
         llm=google.LLM(
-            model="gemini-2.5-flash",
-            thinking_config=types.ThinkingConfig(thinking_budget=0),  # 0 = no thinking, faster replies
+            model=cfg.LLM_MODEL,
+            thinking_config=types.ThinkingConfig(thinking_budget=cfg.THINKING_BUDGET),
         ),
         tts=elevenlabs.TTS(
             api_key=eleven_key or None,
-            voice_id=os.environ.get("ELEVEN_VOICE_ID", "EXAVITQu4vr4xnSDxMaL"),
-            model=os.environ.get("ELEVEN_MODEL", "eleven_multilingual_v2"),
+            voice_id=os.environ.get("ELEVEN_VOICE_ID", cfg.TTS_VOICE_ID_DEFAULT),
+            model=os.environ.get("ELEVEN_MODEL", cfg.TTS_MODEL_DEFAULT),
         ),
         vad=silero.VAD.load(
-            min_speech_duration=0.4,    # require ~400ms speech before treating as user (reduces cutoffs)
-            min_silence_duration=1.0,   # wait 1s before end-of-turn (let agent finish)
-            activation_threshold=0.65,  # need clearer speech to interrupt (less noise triggers)
+            min_speech_duration=cfg.VAD_MIN_SPEECH_DURATION,
+            min_silence_duration=cfg.VAD_MIN_SILENCE_DURATION,
+            activation_threshold=cfg.VAD_ACTIVATION_THRESHOLD,
         ),
         turn_detection="vad",
         allow_interruptions=True,
@@ -112,19 +104,6 @@ async def my_agent(ctx: agents.JobContext):
                 pass  # No running loop (e.g. during shutdown)
 
         session.on("conversation_item_added", on_conversation_item_added)
-    
-    # # Commented out: OpenAI Realtime Model (replaced with Google Gemini)
-    # session = AgentSession(
-    #     llm=openai.realtime.RealtimeModel(
-    #         voice="coral"
-    #     )
-    # )
-
-    # mcp_server = MCPServerSse(
-    #     params={"url": os.environ.get("ZAPIER_MCP_URL")},
-    #     cache_tools_list=True,
-    #     name="SSE MCP Server"
-    # )
 
     try:
         mcp_server = MCPServerHttp(
@@ -180,7 +159,7 @@ async def my_agent(ctx: agents.JobContext):
             try:
                 payload = _json.loads(packet.data.decode("utf-8"))
                 desc = payload.get("obstacle") or "object"
-                phrase = f"Watch out. Obstacle detected. {desc} in front."
+                phrase = cfg.OBSTACLE_PHRASE_TEMPLATE.format(description=desc)
                 session.interrupt()
                 session.say(phrase)
             except Exception as e:
@@ -241,10 +220,9 @@ async def my_agent(ctx: agents.JobContext):
     room.on("participant_disconnected", _on_participant_disconnected)
 
     async def say_greeting():
-        """Ask where to go as soon as the session is ready (mic enabled)."""
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(cfg.GREETING_DELAY_SECONDS)
         try:
-            await session.say("Where would you like to go?")
+            await session.say(cfg.GREETING_PHRASE)
         except Exception as e:
             logger.debug("Greeting say: %s", e)
 
