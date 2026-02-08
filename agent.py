@@ -213,7 +213,7 @@ async def my_agent(ctx: agents.JobContext):
             logger.debug(f"GPS data_received parse: {e}")
 
     room.on("data_received", _on_data_received)
-    logger.info("Subscribed to room GPS data (topic=%s)", GPS_DATA_TOPIC)
+    logger.info("Subscribed to room data (topic=%s, %s)", GPS_DATA_TOPIC, OBSTACLE_ALERT_TOPIC)
 
     def _on_participant_disconnected(participant):
         """When the phone disconnects, leave the room so next connect gets a fresh agent."""
