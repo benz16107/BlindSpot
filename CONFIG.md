@@ -22,8 +22,22 @@ Single place to see **where every API key and major setting lives**, and where t
 | **ZAPIER_MCP_TOKEN** | Agent (MCP)   | `.env.local` only |
 | **BACKBOARD_API_KEY**| Agent (memory)| `.env.local` only |
 
-- **Flutter app** reads: `lib/config.dart` and build-time `--dart-define`. It does **not** read `.env.local`.
-- **Agent (Python)** reads: `.env.local` (and `agent_config.py` for non-secret settings). Copy `.env.local.template` to `.env.local` and fill in values.
+- **Flutter app** reads: `lib/config.dart` and build-time `--dart-define`. It does **not** read `.env.local`. **No keys are stored in `config.dart`** — use `--dart-define` to avoid exposing keys in git.
+- **Agent (Python)** reads: `.env.local` (and `agent_config.py` for non-secret settings). Copy `.env.local.template` to `.env.local` and fill in values. `.env.local` is gitignored.
+
+**Running the Flutter app with keys:**
+```bash
+# Option A: Use run script (recommended — no long command)
+./run_flutter.sh
+
+# Option B: Copy dart_defines.json.example to dart_defines.json, add your keys, then:
+flutter run --dart-define-from-file=dart_defines.json
+
+# Option C: Pass defines inline
+flutter run --dart-define=GOOGLE_API_KEY=xxx --dart-define=LIVEKIT_URL=xxx --dart-define=LIVEKIT_API_KEY=xxx --dart-define=LIVEKIT_API_SECRET=xxx
+```
+
+`dart_defines.json` is gitignored — copy `dart_defines.json.example` to `dart_defines.json` and add your keys.
 
 ---
 
@@ -51,4 +65,4 @@ Template: **`.env.local.template`**. Copy to **`.env.local`** and set:
 - `ZAPIER_MCP_URL`, `ZAPIER_MCP_TOKEN` — optional Zapier MCP
 - `BACKBOARD_API_KEY` — optional memory
 
-Do not commit `.env.local` (it should be in `.gitignore`).
+**Do not commit `.env.local`** — it is in `.gitignore`. Use `.env.local.template` as a guide and add your own keys locally.

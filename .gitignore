@@ -1,3 +1,9 @@
+# API keys and secrets — never commit these
+.env
+.env.local
+.env.*.local
+dart_defines.json
+
 # Miscellaneous
 *.class
 *.log
@@ -43,12 +49,3 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
-
-# Secrets — never commit. Use .env.local.template to create .env.local with your keys.
-.env
-.env.local
-.env.*.local
-!.env.local.template
-
-# Backboard local state (assistant/thread ids). Copy from .backboard.json.example if needed.
-.backboard.json
