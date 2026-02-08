@@ -37,7 +37,7 @@ class VoiceService extends ChangeNotifier {
 
   bool _disconnecting = false;
 
-  /// Generate a LiveKit JWT in-app (no token server). Requires [liveKitUrl], [liveKitApiKey], [liveKitApiSecret] in config.
+  /// Generate a LiveKit JWT in-app (no token server). Includes roomConfig so LiveKit dispatches voice-agent when we join.
   String _makeLiveKitToken(String identity, String roomName) {
     final jwt = JWT(
       {
@@ -47,6 +47,11 @@ class VoiceService extends ChangeNotifier {
           'canPublish': true,
           'canSubscribe': true,
           'canPublishData': true,
+        },
+        'roomConfig': {
+          'agents': [
+            {'agentName': 'voice-agent'},
+          ],
         },
       },
       subject: identity,

@@ -238,6 +238,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
   DateTime? _lastObstacleAnnounceTime; // TTS cooldown
   final FlutterTts _tts = FlutterTts();
   GenerativeModel? _obstacleModel; // cached for speed
+  bool _obstacleCheckInFlight = false; // prevent overlapping Gemini calls
 
   @override
   void initState() {
@@ -491,15 +492,22 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
 
   Future<void> _runObstacleCheck() async {
     if (!_obstacleDetectionOn) return;
+    if (_obstacleCheckInFlight) return;
     final controller = _controller;
     if (!mounted || controller == null || !controller.value.isInitialized) return;
 
+    _obstacleCheckInFlight = true;
     try {
       final xfile = await controller.takePicture();
       List<int> bytes = await xfile.readAsBytes();
-      if (!mounted || bytes.isEmpty) return;
+      if (!mounted || bytes.isEmpty) {
+        debugPrint('Obstacle: no image bytes from camera');
+        _obstacleCheckInFlight = false;
+        return;
+      }
 
       bytes = _resizeObstacleImage(bytes);
+      debugPrint('Obstacle: frame ${bytes.length} bytes');
 
       Map<String, dynamic>? body;
       if (useLocalObstacleDetection && googleApiKey.trim().isNotEmpty) {
@@ -525,7 +533,15 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
         body = jsonDecode(response.body) as Map<String, dynamic>?;
       }
 
-      if (!mounted || body == null) return;
+      if (!mounted) {
+        _obstacleCheckInFlight = false;
+        return;
+      }
+      if (body == null) {
+        debugPrint('Obstacle: no result from Gemini/server');
+        _obstacleCheckInFlight = false;
+        return;
+      }
       if (!_obstacleDetectionOn) return;
       final detected = body['obstacle_detected'] == true;
       final distance = (body['distance'] as String? ?? '').toString().toLowerCase();
@@ -557,13 +573,16 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
       } else {
         _stopObstacleAlerts();
       }
-    } catch (_) {
+    } catch (e) {
+      debugPrint('Obstacle check error: $e');
       if (mounted && _obstacleDetectionOn) {
         setState(() {
           _obstacleNear = false;
           _obstacleDescription = null;
         });
       }
+    } finally {
+      _obstacleCheckInFlight = false;
     }
   }
 
@@ -583,6 +602,10 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
 
   /// Call Gemini API directly from the app (no obstacle server). Model cached for speed.
   Future<Map<String, dynamic>?> _analyzeObstacleLocal(List<int> imageBytes) async {
+    if (imageBytes.isEmpty) {
+      debugPrint('Obstacle Gemini: skipped empty image');
+      return null;
+    }
     try {
       _obstacleModel ??= GenerativeModel(
         model: obstacleModel,
@@ -600,7 +623,10 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
         ]),
       ]);
       final text = response.text?.trim() ?? '';
-      if (text.isEmpty) return null;
+      if (text.isEmpty) {
+        debugPrint('Obstacle Gemini: empty response (candidates: ${response.candidates.length})');
+        return null;
+      }
       String jsonStr = text;
       if (text.contains('```')) {
         final start = text.indexOf('{');
