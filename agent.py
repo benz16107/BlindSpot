@@ -26,6 +26,8 @@ from mcp_client import MCPServerHttp, MCPToolsIntegration   # or MCPServerStream
 from backboard_store import init_backboard
 from google_maps import NavigationTool, GPS_DATA_TOPIC
 
+OBSTACLE_DATA_TOPIC = "obstacle"
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("agent")
@@ -171,7 +173,13 @@ async def my_agent(ctx: agents.JobContext):
     import json as _json
 
     def _on_data_received(packet):
-        if (getattr(packet, "topic", None) or "") != GPS_DATA_TOPIC:
+        topic = getattr(packet, "topic", None) or ""
+
+        # Obstacle alerts are announced by the app (TTS only); no agent voice to avoid double announcement
+        if topic == OBSTACLE_DATA_TOPIC:
+            return
+
+        if topic != GPS_DATA_TOPIC:
             return
         try:
             payload = _json.loads(packet.data.decode("utf-8"))
