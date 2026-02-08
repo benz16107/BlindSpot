@@ -16,8 +16,9 @@ dependencies:
 
   # Camera access (Android + iOS)
   camera: ^0.11.0+2
-  record: ^5.0.0
+  record: ^6.0.0
   path_provider: ^2.1.0
+  shared_preferences: ^2.2.0
 
 dev_dependencies:
   flutter_test:

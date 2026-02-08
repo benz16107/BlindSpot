@@ -1,6 +1,7 @@
 import asyncio
 import os
 import logging
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -53,18 +54,45 @@ class NavigationTool:
         self._latest_lat = lat
         self._latest_lng = lng
 
-    @llm.function_tool(description="Get the user's current location. Use when they ask 'where am I?' or 'what's my location?'. Uses live GPS from the phone.")
-    async def get_current_location(self) -> str:
-        """Return current location from latest GPS sent by the phone."""
+    @llm.function_tool(description="Get the user's current location. Use when they ask 'where am I?' or 'what's my location?'. By default return only the address/place name from Google Maps. Set include_coordinates=True only when the user explicitly asks for coordinates or latitude/longitude.")
+    async def get_current_location(self, include_coordinates: bool = False) -> str:
+        """Return current location (address only by default; add coordinates only if include_coordinates is True)."""
         if self._latest_lat is None or self._latest_lng is None:
             return "Location not available yet. Make sure the app is open and sending GPS."
-        return f"Current location: {self._latest_lat:.6f}, {self._latest_lng:.6f} (latitude, longitude)."
 
-    @llm.function_tool(description="Start turn-by-turn navigation from an origin to a destination. Use this when the user wants to be guided step-by-step (e.g. 'navigate me to X', 'guide me to Y').")
+        lat, lng = self._latest_lat, self._latest_lng
+        coords_str = f"{lat:.6f}, {lng:.6f} (latitude, longitude)"
+
+        if self.client:
+            try:
+                results = await asyncio.to_thread(
+                    self.client.reverse_geocode,
+                    (lat, lng),
+                )
+                if results and len(results) > 0:
+                    addr = results[0].get("formatted_address")
+                    if isinstance(addr, str) and addr.strip():
+                        if include_coordinates:
+                            return f"You are at {addr}. Coordinates: {coords_str}."
+                        return f"You are at {addr}."
+            except Exception as e:
+                logger.debug("Reverse geocode failed: %s", e)
+
+        return f"You are at coordinates {coords_str}."
+
+    @llm.function_tool(description="Start turn-by-turn navigation from an origin to a destination. Always use origin 'current location' unless the user explicitly gives a different start address (e.g. 'navigate me to X', 'take me to Y' → origin='current location', destination=X or Y).")
     async def start_navigation(self, origin: str, destination: str, mode: str = "walking") -> str:
         if not self.client:
             return "Google Maps API key not configured."
-            
+
+        # Replace "current location" with live GPS from the phone (Directions API needs lat,lng or address)
+        origin_lower = (origin or "").strip().lower()
+        if origin_lower in ("current location", "current location.", "my location", "here"):
+            if self._latest_lat is None or self._latest_lng is None:
+                return "I don't have your location yet. Make sure the app is open and GPS is on, then ask again."
+            origin = f"{self._latest_lat},{self._latest_lng}"
+            logger.info("Using phone GPS as origin: %s", origin)
+
         try:
             # Fetch alternative routes (blocking call)
             directions_result = await asyncio.to_thread(
@@ -123,44 +151,72 @@ class NavigationTool:
                     logger.error(f"Gemini analysis failed, falling back to default route: {g_err}")
 
             self.session.start_route(selected_route, destination)
-            
-            # Get initial instruction
+
+            # Total distance, duration, and arrival time from all legs
             legs = selected_route.get("legs", [])
+            total_meters = 0
+            total_seconds = 0
+            for leg in legs:
+                total_meters += leg.get("distance", {}).get("value", 0) or 0
+                total_seconds += leg.get("duration", {}).get("value", 0) or 0
+            distance_text = legs[0].get("distance", {}).get("text", "N/A") if legs else "N/A"
+            duration_text = legs[0].get("duration", {}).get("text", "N/A") if legs else "N/A"
+            if len(legs) > 1:
+                distance_text = f"{total_meters / 1000:.1f} km" if total_meters else "N/A"
+                mins = int(total_seconds // 60)
+                duration_text = f"{mins} min" if mins < 60 else f"{mins // 60} hr {mins % 60} min"
+            arrival = (datetime.now() + timedelta(seconds=total_seconds)) if total_seconds else None
+            try:
+                arrival_str = (arrival.strftime("%I:%M %p").lstrip("0") if arrival else "N/A")
+            except Exception:
+                arrival_str = "N/A"
+            # Announce trip summary first (distance, time, arrival), then first direction
+            summary = f"Your trip: total distance {distance_text}, estimated time {duration_text}, arrival around {arrival_str}.{analysis_text} "
             if legs:
                 steps = legs[0].get("steps", [])
                 if steps:
                     first_instruction = self.session._clean_instruction(steps[0].get('html_instructions', 'Proceed to route'))
-                    return f"Navigation started.{analysis_text} {first_instruction}"
-            
-            return f"Navigation started.{analysis_text} Proceed to the route."
+                    return f"Navigation started. {summary}First direction: {first_instruction}"
+            return f"Navigation started. {summary}Proceed to the route."
             
         except Exception as e:
+            err_msg = str(e)
             logger.error(f"Error starting navigation: {e}")
-            return f"Error starting navigation: {str(e)}"
+            if "REQUEST_DENIED" in err_msg or "API_KEY_INVALID" in err_msg or "referer" in err_msg.lower():
+                return (
+                    "Google Maps error: check that Directions API is enabled and your API key is valid. "
+                    "In Google Cloud Console: APIs & Services → Enable APIs → enable 'Directions API'. "
+                    "Ensure billing is enabled on the project."
+                )
+            return f"Error starting navigation: {err_msg}"
 
     @llm.function_tool(description="Update user location (latitude, longitude) for navigation tracking. Call when you receive the user's current GPS coordinates to get the next turn instruction.")
     async def update_location(self, lat: float, lng: float) -> str:
         """
-        Updates the user's location. If a turn is approaching, returns the instruction.
-        Otherwise, indicates tracking works.
+        Updates the user's location. Returns an instruction only when approaching a turn
+        (within ~45m warning or ~12m "Now"); otherwise returns empty string so the agent
+        does not announce anything (no repeated "continue on route").
         """
-        # This is fast enough to be sync, but wrapping for consistency if needed.
-        # However, it accesses self.session state, no external IO.
-        # We can leave it sync or make it async no-op waiting.
         if not self.session.active_route:
             return "Navigation not active."
-            
+
         instruction = self.session.update_location(lat, lng)
         if instruction:
             return instruction
-        
-        return "Location updated. Continue on route."
+        # No turn to announce – return empty so the agent does not speak
+        return ""
 
-    @llm.function_tool(description="Get walking directions from an origin to a destination (static list of steps)")
+    @llm.function_tool(description="Get walking directions from an origin to a destination (static list of steps). Use origin 'current location' when the user wants to start from where they are.")
     async def get_walking_directions(self, origin: str, destination: str) -> str:
         if not self.client:
             return "Google Maps API key not configured."
-        
+
+        origin_lower = (origin or "").strip().lower()
+        if origin_lower in ("current location", "current location.", "my location", "here"):
+            if self._latest_lat is None or self._latest_lng is None:
+                return "I don't have your location yet. Make sure the app is open and GPS is on, then ask again."
+            origin = f"{self._latest_lat},{self._latest_lng}"
+
         try:
             directions_result = await asyncio.to_thread(
                 self.client.directions,
@@ -195,8 +251,13 @@ class NavigationTool:
             return direction_text
             
         except Exception as e:
+            err_msg = str(e)
             logger.error(f"Error getting directions: {e}")
-            return f"Error getting directions: {str(e)}"
+            if "REQUEST_DENIED" in err_msg or "API_KEY_INVALID" in err_msg:
+                return (
+                    "Google Maps error: enable Directions API and check your API key in Google Cloud Console."
+                )
+            return f"Error getting directions: {err_msg}"
 
     @llm.function_tool(description="Search for a place or point of interest")
     async def search_places(self, query: str) -> str:
@@ -236,8 +297,16 @@ class NavigationTool:
             return response_text
 
         except requests.exceptions.HTTPError as e:
-            logger.error(f"Error searching places: {e.response.text if e.response else e}")
-            return f"Error searching places: {str(e)}"
+            body = (e.response.text if e.response else "") or str(e)
+            logger.error(f"Error searching places: {e.response.status_code} {body}")
+            if e.response and e.response.status_code == 403:
+                return (
+                    "Places search failed: enable 'Places API (New)' in Google Cloud Console and ensure billing is on. "
+                    "APIs & Services → Enable APIs → search for 'Places API (New)'."
+                )
+            if "REQUEST_DENIED" in body or "API_KEY_INVALID" in body:
+                return "Places error: check API key and that Places API (New) is enabled."
+            return f"Error searching places: {body[:200]}"
         except Exception as e:
             logger.error(f"Error searching places: {e}")
             return f"Error searching places: {str(e)}"

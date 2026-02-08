@@ -32,11 +32,17 @@ class VoiceService extends ChangeNotifier {
   }
 
   /// Connect to the voice agent (publish mic; start sending GPS). Memory from previous sessions is preserved on the server.
-  Future<void> connect() async {
+  /// [tokenUrlOverride] Use this on a physical device to point to your computer's IP (e.g. http://192.168.1.100:8765/token).
+  Future<void> connect({String? tokenUrlOverride}) async {
     if (_room != null) return;
 
+    final tokenServerUrl = (tokenUrlOverride ?? tokenUrl).trim();
+    if (tokenServerUrl.isEmpty) {
+      throw Exception('Token server URL not set. Set it in the app (e.g. http://YOUR_COMPUTER_IP:8765/token).');
+    }
+
     try {
-      final uri = Uri.parse(tokenUrl);
+      final uri = Uri.parse(tokenServerUrl);
       final resp = await http.get(uri);
       if (resp.statusCode != 200) {
         throw Exception('Token failed: ${resp.statusCode} ${resp.body}');
