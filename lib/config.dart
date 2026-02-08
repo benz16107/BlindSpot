@@ -1,10 +1,9 @@
 /// Central app config: API keys and object-detection model, prompt, and parameters.
-/// Edit this file to change keys, obstacle sensitivity, and detection behavior.
-///
-/// WARNING: Default values may contain secrets. Do not commit real keys to a public repo.
+/// Do not commit real keys. Set via --dart-define or use empty defaults and a token server.
+/// See .env.local.template and CONFIG.md for where to get keys.
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// API KEYS (set via --dart-define or defaultValues below)
+// API KEYS (set via --dart-define; empty = use token server / no in-app obstacle)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Token server URL (used when not using in-app LiveKit token).
@@ -13,28 +12,28 @@ const String tokenUrl = String.fromEnvironment(
   defaultValue: 'http://localhost:8765/token',
 );
 
-/// Google AI API key. Used for in-app obstacle detection (Gemini). Set via --dart-define=GOOGLE_API_KEY=...
+/// Google AI API key for in-app obstacle detection (Gemini). Set via --dart-define=GOOGLE_API_KEY=...
 const String googleApiKey = String.fromEnvironment(
   'GOOGLE_API_KEY',
-  defaultValue: '***REMOVED***',
+  defaultValue: '',
 );
 
-/// LiveKit server URL. Must match LIVEKIT_URL in .env.local used by agent.py so app and agent join the same cloud.
+/// LiveKit server URL. Must match LIVEKIT_URL in .env.local used by agent.py.
 const String liveKitUrl = String.fromEnvironment(
   'LIVEKIT_URL',
-  defaultValue: 'wss://testproject-o9b5hv33.livekit.cloud',
+  defaultValue: '',
 );
 
 /// LiveKit API key. Set via --dart-define=LIVEKIT_API_KEY=...
 const String liveKitApiKey = String.fromEnvironment(
   'LIVEKIT_API_KEY',
-  defaultValue: '***REMOVED***',
+  defaultValue: '',
 );
 
 /// LiveKit API secret. Set via --dart-define=LIVEKIT_API_SECRET=...
 const String liveKitApiSecret = String.fromEnvironment(
   'LIVEKIT_API_SECRET',
-  defaultValue: '***REMOVED***',
+  defaultValue: '',
 );
 
 bool get useLocalObstacleDetection => googleApiKey.trim().isNotEmpty;

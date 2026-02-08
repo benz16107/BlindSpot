@@ -119,6 +119,18 @@ No separate token server or obstacle server is required: the app can generate th
 
 ---
 
+## Secrets and API keys
+
+**Do not commit real API keys or secrets.** This repo uses empty defaults and templates:
+
+- **Agent:** Copy `.env.local.template` → `.env.local` and add your keys. `.env.local` is gitignored.
+- **App:** Set keys via `--dart-define` (e.g. `GOOGLE_API_KEY=...`, `LIVEKIT_API_KEY=...`, `LIVEKIT_API_SECRET=...`, `LIVEKIT_URL=...`) or edit `lib/config.dart` locally (keep defaults empty when pushing).
+- **Backboard:** If you use memory, `.backboard.json` is gitignored; copy `.backboard.json.example` if needed.
+
+See [CONFIG.md](CONFIG.md) for where each key is used.
+
+---
+
 ## Configuration at a glance
 
 | What | Where |
@@ -136,7 +148,7 @@ No separate token server or obstacle server is required: the app can generate th
    - Run: `uv run python agent.py dev`.
 
 2. **App**  
-   - Set LiveKit (and optional `GOOGLE_API_KEY` for in-app obstacle) in `lib/config.dart` or via `--dart-define`.  
+   - Set LiveKit URL/key/secret and optional `GOOGLE_API_KEY` via `--dart-define` or in `lib/config.dart` (repo ships with empty defaults; do not commit real keys).  
    - Run: `flutter run` (BLINDSPOT).
 
 3. On the phone: enable **voice** (mic) and optionally **obstacle** (camera → haptics + voice). Ask “Where am I?” or “Navigate to [address]” / “Take me to the nearest coffee shop.”

@@ -44,15 +44,31 @@ server = AgentServer()
 async def my_agent(ctx: agents.JobContext):
     room_name = getattr(ctx.room, "name", None) or "unknown"
     logger.info("Agent job started for room=%s", room_name)
-    # 1. Initialize Backboard memory FIRST
+
+    # 1. Run Backboard init and MCP connect in parallel to reduce activation time
+    mcp_server = MCPServerHttp(
+        params={
+            "url": os.environ.get("ZAPIER_MCP_URL"),
+            "headers": {
+                "Authorization": f"Bearer {os.environ.get('ZAPIER_MCP_TOKEN')}"
+            }
+        },
+        cache_tools_list=True,
+        name="Zapier MCP Server"
+    )
+    backboard_task = asyncio.create_task(init_backboard())
+    mcp_connect_task = asyncio.create_task(mcp_server.connect())
     try:
-        memory_manager = await init_backboard()
+        memory_manager = await backboard_task
         logger.info(f"✓ Backboard initialized: thread_id={memory_manager.thread_id}")
     except Exception as e:
         logger.error(f"Failed to initialize Backboard: {e}")
-        # Continue without memory - voice still works
         memory_manager = None
-    
+    try:
+        await mcp_connect_task
+    except Exception as e:
+        logger.warning("MCP connect (parallel) failed: %s", e)
+
     # 2. Load thread history (from agent_config)
     context_text = ""
     if memory_manager:
@@ -106,16 +122,6 @@ async def my_agent(ctx: agents.JobContext):
         session.on("conversation_item_added", on_conversation_item_added)
 
     try:
-        mcp_server = MCPServerHttp(
-            params={
-                "url": os.environ.get("ZAPIER_MCP_URL"),
-                "headers": {
-                    "Authorization": f"Bearer {os.environ.get('ZAPIER_MCP_TOKEN')}"
-                }
-            },
-            cache_tools_list=True,
-            name="Zapier MCP Server"
-        )
         agent = await MCPToolsIntegration.create_agent_with_tools(
             agent_class=Assistant,
             mcp_servers=[mcp_server],

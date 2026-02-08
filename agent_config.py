@@ -34,8 +34,8 @@ VAD_ACTIVATION_THRESHOLD = 0.65 # speech confidence to interrupt
 # --- Memory (Backboard) ---
 MEMORY_HISTORY_LIMIT = 10  # number of past messages to include in context
 
-# --- Greeting ---
-GREETING_DELAY_SECONDS = 2.0
+# --- Greeting (lower delay = faster “activation” after join) ---
+GREETING_DELAY_SECONDS = 0.4
 GREETING_PHRASE = "Where would you like to go?"
 
 # --- Obstacle voice (when app publishes obstacle_alert) ---
