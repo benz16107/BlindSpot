@@ -7,6 +7,8 @@
 	
 	<key>NSCameraUsageDescription</key>
 	<string>This app needs camera access to show the camera feed.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>This app uses the microphone for voice navigation assistance.</string>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>

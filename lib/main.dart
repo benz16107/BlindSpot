@@ -1,13 +1,31 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:math' as math;
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_compass/flutter_compass.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:http/http.dart' as http;
+import 'package:path_provider/path_provider.dart';
+import 'package:record/record.dart';
+
+import 'config.dart';
+import 'voice_service.dart';
+import 'package:flutter_tts/flutter_tts.dart';
+import 'package:google_generative_ai/google_generative_ai.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  final cameras = await availableCameras();
+  List<CameraDescription> cameras = [];
+  try {
+    cameras = await availableCameras();
+  } catch (e) {
+    // Camera plugin not implemented on this platform (e.g. macOS desktop)
+    cameras = [];
+  }
   runApp(MyApp(cameras: cameras));
 }
 
@@ -41,24 +59,69 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
   StreamSubscription<Position>? _posSub;
   Position? _pos;
   String? _locError;
+  // Compass: 0 = north, 90 = east, 180 = south, 270 = west
+  double? _heading;
+  StreamSubscription<CompassEvent>? _compassSub;
 
-  // Haptic feedback state
-  Timer? _hapticTimer;
-  DateTime? _lastHapticTime;
-  bool _justVibrated = false;
+  // Voice agent: on when button pressed, off when pressed again; memory kept on server
+  final VoiceService _voiceService = VoiceService();
+  bool _voiceConnecting = false;
+  String? _voiceError;
+
+  // Mic level indicator: test when not connected to voice (record package)
+  final AudioRecorder _audioRecorder = AudioRecorder();
+  bool _micTesting = false;
+  double? _micLevel; // 0..1 normalized from dBFS
+  StreamSubscription<Amplitude>? _micLevelSub;
+
+  // Obstacle detection: periodic frame upload, TTS + constant haptic when obstacle near
+  bool _obstacleDetectionOn = false;
+  Timer? _obstacleTimer;
+  Timer? _obstacleHapticTimer; // repeating haptic while obstacle near
+  bool _obstacleNear = false;
+  String? _obstacleDescription;
+  DateTime? _lastObstacleAnnounceTime; // TTS cooldown
+  final FlutterTts _tts = FlutterTts();
 
   @override
   void initState() {
     super.initState();
+    _voiceService.addListener(_onVoiceStateChanged);
     _start();
+  }
+
+  Future<void> _onVoiceButtonPressed() async {
+    HapticFeedback.selectionClick();
+    if (_voiceConnecting) return;
+    setState(() {
+      _voiceError = null;
+      _voiceConnecting = true;
+    });
+    try {
+      if (_voiceService.isConnected) {
+        await _voiceService.disconnect();
+      } else {
+        await _voiceService.connect();
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _voiceError = e.toString();
+          _voiceConnecting = false;
+        });
+      }
+      return;
+    }
+    if (mounted) setState(() => _voiceConnecting = false);
   }
 
   Future<void> _start() async {
     if (widget.cameras.isEmpty) {
       setState(() {
-        _status = "No cameras found.";
+        _status = "No camera (e.g. macOS). GPS + voice only.";
         _initializing = false;
       });
+      await _startLocation();
       return;
     }
 
@@ -71,7 +134,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
       camera,
       ResolutionPreset.medium,
       enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.yuv420, // good for CV later
+      imageFormatGroup: ImageFormatGroup.jpeg,
     );
 
     try {
@@ -81,6 +144,8 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
         _initializing = false;
         _status = "Camera ready. Getting GPS…";
       });
+
+      // Obstacle detection starts only when user toggles it on (see FAB)
 
       // Start location after camera is ready (so UI feels responsive)
       await _startLocation();
@@ -138,8 +203,16 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
         _status = "Camera + GPS ready.";
         _locError = null;
       });
+      _voiceService.updateGps(first.latitude, first.longitude, _heading);
 
-      // 4) Continuous updates while camera screen is open
+      // 4) Compass updates (heading 0–360)
+      _compassSub?.cancel();
+      _compassSub = FlutterCompass.events?.listen((CompassEvent e) {
+        if (!mounted) return;
+        if (e.heading != null) setState(() => _heading = e.heading);
+      });
+
+      // 5) Continuous position updates while camera screen is open
       const settings = LocationSettings(
         accuracy: LocationAccuracy.bestForNavigation,
         distanceFilter: 3, // meters before emitting an update
@@ -150,7 +223,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
         (p) {
           if (!mounted) return;
           setState(() => _pos = p);
-          _handleHapticFeedback(p);
+          _voiceService.updateGps(p.latitude, p.longitude, _heading);
         },
         onError: (e) {
           if (!mounted) return;
@@ -159,9 +232,6 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
           });
         },
       );
-
-      // Start haptic feedback timer (checks every 3 seconds if moving)
-      _startHapticTimer();
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -171,44 +241,271 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
     }
   }
 
-  void _startHapticTimer() {
-    _hapticTimer?.cancel();
-    _hapticTimer = Timer.periodic(const Duration(seconds: 3), (_) {
-      if (_pos != null && _pos!.speed > 0.5) {
-        _triggerHaptic();
+  void _onVoiceStateChanged() {
+    if (!mounted) return;
+    if (!_voiceService.isConnected && _obstacleDetectionOn) {
+      _stopObstacleDetection();
+      setState(() => _obstacleDetectionOn = false);
+    }
+    setState(() {});
+  }
+
+  /// Obstacle endpoint: same host as token URL from config (only used when not using local Gemini).
+  String get _obstacleFrameUrl {
+    final u = Uri.parse(tokenUrl.trim().isEmpty ? 'http://localhost:8765/token' : tokenUrl);
+    return u.resolve('/obstacle-frame').toString();
+  }
+
+  void _startObstacleDetection() {
+    _obstacleTimer?.cancel();
+    final interval = Duration(seconds: obstacleCheckIntervalSeconds);
+    _obstacleTimer = Timer.periodic(interval, (_) => _runObstacleCheck());
+    _runObstacleCheck(); // run first check immediately
+  }
+
+  void _stopObstacleDetection() {
+    _obstacleTimer?.cancel();
+    _obstacleTimer = null;
+    _stopObstacleAlerts();
+    if (mounted) {
+      setState(() {
+        _obstacleNear = false;
+        _obstacleDescription = null;
+      });
+    }
+  }
+
+  /// Constant haptic vibration while obstacle is detected.
+  void _startObstacleAlerts(String description) {
+    _obstacleHapticTimer?.cancel();
+    _obstacleHapticTimer = Timer.periodic(Duration(milliseconds: obstacleHapticPeriodMs), (_) {
+      if (!_obstacleNear || !mounted) {
+        _stopObstacleAlerts();
+        return;
       }
+      HapticFeedback.heavyImpact();
     });
   }
 
-  void _handleHapticFeedback(Position position) {
-    // Check if we should vibrate based on rate limiting
-    if (position.speed > 0.5) {
-      final now = DateTime.now();
-      if (_lastHapticTime == null ||
-          now.difference(_lastHapticTime!).inSeconds >= 3) {
-        _triggerHaptic();
-        _lastHapticTime = now;
+  void _stopObstacleAlerts() {
+    _obstacleHapticTimer?.cancel();
+    _obstacleHapticTimer = null;
+    _tts.stop();
+  }
+
+  Future<void> _announceObstacle(String description) async {
+    _lastObstacleAnnounceTime = DateTime.now();
+    final phrase = description.toLowerCase() == 'object' || description.isEmpty
+        ? 'Obstacle detected. Object in front.'
+        : 'Obstacle detected. $description in front.';
+    await _tts.speak(phrase);
+  }
+
+  void _onObstacleDetectionToggle() {
+    HapticFeedback.selectionClick();
+    if (_obstacleDetectionOn) {
+      setState(() => _obstacleDetectionOn = false);
+      _stopObstacleDetection();
+    } else {
+      if (!_voiceService.isConnected) return;
+      setState(() => _obstacleDetectionOn = true);
+      _startObstacleDetection();
+    }
+  }
+
+  Future<void> _runObstacleCheck() async {
+    if (!_obstacleDetectionOn) return;
+    final controller = _controller;
+    if (!mounted || controller == null || !controller.value.isInitialized) return;
+
+    try {
+      final xfile = await controller.takePicture();
+      final bytes = await xfile.readAsBytes();
+      if (!mounted || bytes.isEmpty) return;
+
+      Map<String, dynamic>? body;
+      if (useLocalObstacleDetection && googleApiKey.trim().isNotEmpty) {
+        body = await _analyzeObstacleLocal(bytes);
+      } else {
+        final url = _obstacleFrameUrl;
+        if (url.isEmpty) return;
+        final response = await http
+            .post(
+              Uri.parse(url),
+              body: bytes,
+              headers: {'Content-Type': 'image/jpeg'},
+            )
+            .timeout(Duration(seconds: obstacleRequestTimeoutSeconds));
+        if (!mounted) return;
+        if (response.statusCode != 200) {
+          setState(() {
+            _obstacleNear = false;
+            _obstacleDescription = null;
+          });
+          return;
+        }
+        body = jsonDecode(response.body) as Map<String, dynamic>?;
+      }
+
+      if (!mounted || body == null) return;
+      if (!_obstacleDetectionOn) return;
+      final detected = body['obstacle_detected'] == true;
+      final distance = (body['distance'] as String? ?? '').toString().toLowerCase();
+      final description = (body['description'] as String? ?? '').toString().trim();
+      final isNear = detected && obstacleAlertDistances.contains(distance);
+
+      if (!mounted || !_obstacleDetectionOn) return;
+      final wasNear = _obstacleNear;
+      setState(() {
+        _obstacleNear = isNear;
+        _obstacleDescription = isNear ? (description.isNotEmpty ? description : 'obstacle') : null;
+      });
+      if (!_obstacleDetectionOn) return;
+      if (isNear) {
+        _startObstacleAlerts(description.isNotEmpty ? description : 'object');
+        final desc = description.isNotEmpty ? description : 'object';
+        final now = DateTime.now();
+        final shouldAnnounce = !wasNear ||
+            _lastObstacleAnnounceTime == null ||
+            now.difference(_lastObstacleAnnounceTime!) > Duration(seconds: obstacleAnnounceCooldownSeconds);
+        if (shouldAnnounce) {
+          _lastObstacleAnnounceTime = now;
+          if (_voiceService.isConnected) {
+            _voiceService.publishObstacleDetected(desc);
+          } else {
+            _announceObstacle(desc);
+          }
+        }
+      } else {
+        _stopObstacleAlerts();
+      }
+    } catch (_) {
+      if (mounted && _obstacleDetectionOn) {
+        setState(() {
+          _obstacleNear = false;
+          _obstacleDescription = null;
+        });
       }
     }
   }
 
-  Future<void> _triggerHaptic() async {
+  /// Call Gemini API directly from the app (no obstacle server). Uses [googleApiKey] from config.
+  Future<Map<String, dynamic>?> _analyzeObstacleLocal(List<int> imageBytes) async {
     try {
-      await HapticFeedback.mediumImpact();
-      // Visual indicator (flashes for debugging)
-      setState(() => _justVibrated = true);
-      Future.delayed(const Duration(milliseconds: 100), () {
-        if (mounted) setState(() => _justVibrated = false);
-      });
+      final model = GenerativeModel(
+        model: obstacleModel,
+        apiKey: googleApiKey.trim(),
+        generationConfig: GenerationConfig(
+          responseMimeType: 'application/json',
+          temperature: obstacleTemperature,
+        ),
+      );
+      final response = await model.generateContent([
+        Content.multi([
+          DataPart('image/jpeg', Uint8List.fromList(imageBytes)),
+          TextPart(obstaclePrompt),
+        ]),
+      ]);
+      final text = response.text?.trim() ?? '';
+      if (text.isEmpty) return null;
+      String jsonStr = text;
+      if (text.contains('```')) {
+        final start = text.indexOf('{');
+        final end = text.lastIndexOf('}') + 1;
+        if (start >= 0 && end > start) jsonStr = text.substring(start, end);
+      }
+      final out = jsonDecode(jsonStr) as Map<String, dynamic>?;
+      if (out == null) return null;
+      final detected = out['obstacle_detected'];
+      bool det;
+      if (detected is bool) {
+        det = detected;
+      } else if (detected is String) {
+        det = ['true', '1', 'yes'].contains(detected.toLowerCase());
+      } else {
+        det = false;
+      }
+      var dist = (out['distance'] as String? ?? '').toString().toLowerCase();
+      if (dist != 'far' && dist != 'medium' && dist != 'near') dist = det ? 'medium' : 'none';
+      return {
+        'obstacle_detected': det,
+        'distance': dist,
+        'description': (out['description'] as String? ?? '').toString().trim(),
+      };
     } catch (e) {
-      // Silently handle haptic errors
+      debugPrint('_analyzeObstacleLocal: $e');
+      return null;
     }
+  }
+
+  Future<void> _stopMicTest() async {
+    HapticFeedback.selectionClick();
+    await _micLevelSub?.cancel();
+    _micLevelSub = null;
+    try {
+      await _audioRecorder.stop();
+    } catch (_) {}
+    if (mounted) {
+      setState(() {
+        _micTesting = false;
+        _micLevel = null;
+      });
+    }
+  }
+
+  Future<void> _startMicTest() async {
+    HapticFeedback.selectionClick();
+    if (_voiceService.isConnected || _micTesting) return;
+    final hasPermission = await _audioRecorder.hasPermission();
+    if (!hasPermission) {
+      if (mounted) {
+        setState(() => _voiceError = 'Mic permission denied');
+      }
+      return;
+    }
+    String path;
+    try {
+      final dir = await getTemporaryDirectory();
+      path = '${dir.path}/mic_test_${DateTime.now().millisecondsSinceEpoch}.m4a';
+    } catch (_) {
+      path = 'mic_test.m4a';
+    }
+    try {
+      await _audioRecorder.start(const RecordConfig(), path: path);
+    } catch (e) {
+      if (mounted) setState(() => _voiceError = 'Mic start: $e');
+      return;
+    }
+    setState(() {
+      _micTesting = true;
+      _micLevel = 0;
+      _voiceError = null;
+    });
+    // dBFS: roughly -60 (quiet) to 0 (loud); normalize to 0..1
+    _micLevelSub = _audioRecorder
+        .onAmplitudeChanged(const Duration(milliseconds: 100))
+        .listen((Amplitude a) {
+      if (!mounted || !_micTesting) return;
+      final normalized = (a.current + 60) / 60;
+      setState(() => _micLevel = normalized.clamp(0.0, 1.0));
+    });
+    // Auto-stop after 15 seconds
+    Future<void>.delayed(const Duration(seconds: 15), () {
+      if (_micTesting) _stopMicTest();
+    });
   }
 
   @override
   void dispose() {
+    _obstacleTimer?.cancel();
+    _obstacleTimer = null;
+    _obstacleHapticTimer?.cancel();
+    _obstacleHapticTimer = null;
+    _stopMicTest();
+    _voiceService.removeListener(_onVoiceStateChanged);
+    _voiceService.disconnect();
     _posSub?.cancel();
-    _hapticTimer?.cancel();
+    _compassSub?.cancel();
     _controller?.dispose();
     super.dispose();
   }
@@ -217,19 +514,18 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
     if (_locError != null) return "GPS: $_locError";
     if (_pos == null) return "GPS: acquiring…";
     final p = _pos!;
-    final speedMsFormatted = p.speed.toStringAsFixed(2);
-    final isMoving = p.speed > 0.5 ? "🚶 Walking" : "⏸ Stopped";
-    return "📍 ${p.latitude.toStringAsFixed(6)}, ${p.longitude.toStringAsFixed(6)}\n"
-        "📏 ±${p.accuracy.toStringAsFixed(0)}m  |  ${isMoving} ($speedMsFormatted m/s)";
+    return "GPS: ${p.latitude.toStringAsFixed(6)}, ${p.longitude.toStringAsFixed(6)} "
+        "(±${p.accuracy.toStringAsFixed(0)}m)";
   }
 
   @override
   Widget build(BuildContext context) {
     final controller = _controller;
 
+    final showCamera = controller != null && controller.value.isInitialized;
     return Scaffold(
       body: SafeArea(
-        child: _initializing || controller == null || !controller.value.isInitialized
+        child: _initializing && controller == null
             ? Container(
                 color: Colors.black,
                 alignment: Alignment.center,
@@ -237,7 +533,11 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
               )
             : Stack(
                 children: [
-                  Positioned.fill(child: CameraPreview(controller)),
+                  Positioned.fill(
+                    child: showCamera
+                        ? _CameraPreviewFullScreen(controller: controller)
+                        : Container(color: Colors.black87, child: Center(child: Text(_status, style: const TextStyle(color: Colors.white54)))),
+                  ),
 
                   // Status + GPS overlay
                   Positioned(
@@ -247,45 +547,223 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                     child: Container(
                       padding: const EdgeInsets.all(12),
                       decoration: BoxDecoration(
-                        color: _justVibrated
-                            ? Colors.green.withOpacity(0.7)
-                            : Colors.black.withOpacity(0.65),
+                        color: Colors.black.withOpacity(0.55),
                         borderRadius: BorderRadius.circular(12),
-                        border: _locError != null
-                            ? Border.all(color: Colors.red, width: 2)
-                            : null,
                       ),
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          if (_locError != null)
-                            Text(
-                              "⚠ GPS: $_locError",
-                              style: const TextStyle(
-                                color: Colors.yellow,
-                                fontWeight: FontWeight.bold,
-                                fontSize: 14,
-                              ),
-                            )
-                          else
-                            Text(
-                              _status,
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 13,
-                              ),
+                          Text(_status, style: const TextStyle(color: Colors.white)),
+                          const SizedBox(height: 6),
+                          Text(_locationLine(), style: const TextStyle(color: Colors.white)),
+                          if (_obstacleNear && _obstacleDescription != null) ...[
+                            const SizedBox(height: 4),
+                            Row(
+                              children: [
+                                Icon(Icons.warning_amber_rounded, color: Colors.orange.shade300, size: 18),
+                                const SizedBox(width: 6),
+                                Text(
+                                  'Obstacle: $_obstacleDescription',
+                                  style: TextStyle(color: Colors.orange.shade200, fontWeight: FontWeight.w500),
+                                ),
+                              ],
                             ),
-                          const SizedBox(height: 8),
-                          Text(
-                            _locationLine(),
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 12,
-                              fontFamily: 'monospace',
+                          ],
+                          if (_voiceError != null) ...[
+                            const SizedBox(height: 4),
+                            Text(
+                              'Voice: $_voiceError',
+                              style: const TextStyle(color: Colors.orangeAccent),
                             ),
-                          ),
+                          ] else ...[
+                            const SizedBox(height: 4),
+                            Text(
+                              _voiceConnecting
+                                  ? 'Voice: connecting…'
+                                  : _voiceService.isConnected
+                                      ? 'Voice: on'
+                                      : 'Voice: off (tap mic to start)',
+                              style: const TextStyle(color: Colors.white70),
+                            ),
+                            // Mic level: test when not connected, or "live" when connected
+                            const SizedBox(height: 6),
+                            if (_micTesting) ...[
+                              Row(
+                                children: [
+                                  SizedBox(
+                                    width: 120,
+                                    height: 20,
+                                    child: ClipRRect(
+                                      borderRadius: BorderRadius.circular(4),
+                                      child: LinearProgressIndicator(
+                                        value: _micLevel ?? 0,
+                                        backgroundColor: Colors.white24,
+                                        valueColor: const AlwaysStoppedAnimation<Color>(Colors.green),
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Text(
+                                    'Mic: ${((_micLevel ?? 0) * 100).toStringAsFixed(0)}%',
+                                    style: const TextStyle(color: Colors.white70, fontSize: 12),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  GestureDetector(
+                                    onTap: _stopMicTest,
+                                    child: Text(
+                                      'Stop',
+                                      style: TextStyle(color: Colors.orange.shade200, fontSize: 12),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                'Listening… speak to test (stops in 15s or tap Stop)',
+                                style: TextStyle(color: Colors.white54, fontSize: 11),
+                              ),
+                            ] else if (!_voiceService.isConnected && !_voiceConnecting) ...[
+                              GestureDetector(
+                                onTap: _startMicTest,
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                  decoration: BoxDecoration(
+                                    color: Colors.white24,
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  child: const Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(Icons.mic_none, size: 18, color: Colors.white70),
+                                      SizedBox(width: 6),
+                                      Text('Test mic level', style: TextStyle(color: Colors.white70, fontSize: 12)),
+                                    ],
+                                  ),
+                                ),
+                              ),
+                            ] else if (_voiceService.isConnected) ...[
+                              Row(
+                                children: [
+                                  Container(
+                                    width: 8,
+                                    height: 8,
+                                    decoration: const BoxDecoration(
+                                      color: Colors.green,
+                                      shape: BoxShape.circle,
+                                      boxShadow: [BoxShadow(color: Colors.green, blurRadius: 4)],
+                                    ),
+                                  ),
+                                  const SizedBox(width: 6),
+                                  Text('Mic live (sending to agent)', style: TextStyle(color: Colors.white70, fontSize: 12)),
+                                ],
+                              ),
+                            ],
+                            // Object detection: tap ⚠ FAB to toggle
+                            const SizedBox(height: 6),
+                            Row(
+                              children: [
+                                Icon(
+                                  Icons.warning_amber_rounded,
+                                  size: 14,
+                                  color: _obstacleDetectionOn ? Colors.orange.shade300 : Colors.white54,
+                                ),
+                                const SizedBox(width: 4),
+                                Text(
+                                  _obstacleDetectionOn
+                                      ? 'Object detection: on'
+                                      : _voiceService.isConnected
+                                          ? 'Object detection: off (tap ⚠ to turn on)'
+                                          : 'Object detection: connect voice first',
+                                  style: TextStyle(
+                                    color: _obstacleDetectionOn ? Colors.orange.shade200 : Colors.white54,
+                                    fontSize: 11,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            if (kIsWeb && !_voiceService.isConnected && !_voiceConnecting) ...[
+                              const SizedBox(height: 2),
+                              Text(
+                                'Chrome: allow mic when prompted. After connecting, tap "Tap to enable speaker" if you can\'t hear.',
+                                style: TextStyle(color: Colors.white54, fontSize: 11),
+                              ),
+                            ],
+                            // Chrome: show speaker unlock when playback failed OR when on web and connected (tap proactively)
+                            if (_voiceService.audioPlaybackFailed || (kIsWeb && _voiceService.isConnected)) ...[
+                              if (kIsWeb) ...[
+                                const SizedBox(height: 4),
+                                Text(
+                                  'Chrome: allow microphone when prompted. If you can\'t hear the agent, tap below.',
+                                  style: TextStyle(color: Colors.white70, fontSize: 12),
+                                ),
+                              ],
+                              const SizedBox(height: 6),
+                              GestureDetector(
+                                onTap: () async {
+                                  HapticFeedback.selectionClick();
+                                  await _voiceService.playbackAudio();
+                                },
+                                child: Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                                  decoration: BoxDecoration(
+                                    color: Colors.orange.withOpacity(0.9),
+                                    borderRadius: BorderRadius.circular(8),
+                                  ),
+                                  child: Text(
+                                    _voiceService.audioPlaybackFailed
+                                        ? 'Tap to enable speaker (Chrome)'
+                                        : 'Tap to enable speaker',
+                                    style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w500),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ],
                         ],
                       ),
+                    ),
+                  ),
+
+                  // Compass: direction you're facing (N/S/E/W)
+                  if (_heading != null)
+                    Positioned(
+                      left: 12,
+                      bottom: 12,
+                      child: _CompassWidget(heading: _heading!),
+                    ),
+
+                  // Object detection + Voice agent: two FABs side by side
+                  Positioned(
+                    right: 12,
+                    bottom: 12,
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        // Object detection: only when voice is on; within 5 m and directly in front
+                        FloatingActionButton(
+                          heroTag: 'obstacle',
+                          onPressed: _voiceService.isConnected ? _onObstacleDetectionToggle : null,
+                          backgroundColor: _obstacleDetectionOn ? Colors.orange : null,
+                          child: Icon(
+                            Icons.warning_amber_rounded,
+                            color: _obstacleDetectionOn ? Colors.white : (_voiceService.isConnected ? null : Colors.white38),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        // Voice agent toggle: on = connect (mic + GPS), off = disconnect (memory kept)
+                        FloatingActionButton(
+                          heroTag: 'mic',
+                          onPressed: _voiceConnecting ? null : _onVoiceButtonPressed,
+                          backgroundColor: _voiceService.isConnected ? Colors.green : null,
+                          child: _voiceConnecting
+                              ? const SizedBox(
+                                  width: 24,
+                                  height: 24,
+                                  child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                                )
+                              : const Icon(Icons.mic),
+                        ),
+                      ],
                     ),
                   ),
                 ],
@@ -293,4 +771,115 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
       ),
     );
   }
+}
+
+/// Full-screen camera preview at native aspect ratio (covers screen, no stretch).
+class _CameraPreviewFullScreen extends StatelessWidget {
+  final CameraController controller;
+
+  const _CameraPreviewFullScreen({required this.controller});
+
+  @override
+  Widget build(BuildContext context) {
+    final ar = controller.value.aspectRatio;
+    if (ar <= 0) {
+      return const Center(child: CircularProgressIndicator(color: Colors.white));
+    }
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final maxW = constraints.maxWidth;
+        final maxH = constraints.maxHeight;
+        // Size (w, h) with w/h = ar that covers maxW x maxH
+        final h = maxH > maxW / ar ? maxH : maxW / ar;
+        final w = ar * h;
+        return Container(
+          color: Colors.black,
+          child: ClipRect(
+            child: Center(
+              child: SizedBox(
+                width: w,
+                height: h,
+                child: CameraPreview(controller),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// Compass showing current heading: N at top, needle points in direction of travel.
+class _CompassWidget extends StatelessWidget {
+  final double heading; // 0 = north, 90 = east (degrees)
+
+  const _CompassWidget({required this.heading});
+
+  @override
+  Widget build(BuildContext context) {
+    const double size = 56;
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: Colors.black.withOpacity(0.6),
+        border: Border.all(color: Colors.white38, width: 2),
+        boxShadow: [
+          BoxShadow(color: Colors.black.withOpacity(0.4), blurRadius: 8, spreadRadius: 1),
+        ],
+      ),
+      child: ClipOval(
+        child: CustomPaint(
+          size: const Size(size, size),
+          painter: _CompassPainter(heading: heading),
+        ),
+      ),
+    );
+  }
+}
+
+class _CompassPainter extends CustomPainter {
+  final double heading;
+
+  _CompassPainter({required this.heading});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+    final radius = size.width / 2 - 4;
+
+    // Cardinal labels (N at top; compass is fixed, needle rotates)
+    final textPainter = (String label, double angleDeg) {
+      final rad = (angleDeg - 90) * math.pi / 180;
+      final pos = center + Offset(radius * 0.75 * math.cos(rad), radius * 0.75 * math.sin(rad));
+      final p = TextPainter(
+        text: TextSpan(text: label, style: const TextStyle(color: Colors.white70, fontSize: 12, fontWeight: FontWeight.bold)),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      p.paint(canvas, pos - Offset(p.width / 2, p.height / 2));
+    };
+    textPainter('N', 0);
+    textPainter('E', 90);
+    textPainter('S', 180);
+    textPainter('W', 270);
+
+    // Needle: direction you're facing (rotates with heading)
+    canvas.save();
+    canvas.translate(center.dx, center.dy);
+    canvas.rotate(heading * math.pi / 180);
+    canvas.translate(-center.dx, -center.dy);
+    final needlePath = Path()
+      ..moveTo(center.dx, center.dy - radius * 0.5)
+      ..lineTo(center.dx - 6, center.dy + radius * 0.35)
+      ..lineTo(center.dx, center.dy + radius * 0.2)
+      ..lineTo(center.dx + 6, center.dy + radius * 0.35)
+      ..close();
+    canvas.drawPath(needlePath, Paint()..color = Colors.orange..style = PaintingStyle.fill);
+    canvas.drawPath(needlePath, Paint()..color = Colors.white..style = PaintingStyle.stroke..strokeWidth = 1.5);
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(covariant _CompassPainter old) => old.heading != heading;
 }
