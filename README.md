@@ -1,6 +1,6 @@
-# Blind Nav Cam
+# BLINDSPOT
 
-A **Flutter app** for assistive walking navigation: live camera, GPS, **voice agent** (turn-by-turn, “where am I?”, nearby search), **obstacle detection** (haptics + voice), and haptics. Built for blind and low-vision users.
+**BLINDSPOT** is a Flutter app for assistive walking navigation: live camera, GPS, **voice agent** (turn-by-turn, “where am I?”, nearby search), **obstacle detection** (haptics + voice), and haptics. Built for blind and low-vision users.
 
 ---
 
@@ -10,7 +10,7 @@ All working components and data flow:
 
 ```mermaid
 flowchart TB
-  subgraph phone["📱 Phone (Flutter app)"]
+  subgraph phone["📱 Phone (BLINDSPOT app)"]
     UI[UI: camera preview, buttons]
     CAM[Camera]
     GPS[GPS + Compass]
@@ -98,7 +98,7 @@ Optional variant: the app can **POST** camera frames to **your own obstacle serv
 
 | Component | Runs on | Role |
 |-----------|---------|------|
-| **Flutter app** | Phone / simulator | Camera, GPS, LiveKit client (mic + data), in-app obstacle (Gemini), haptics, TTS for obstacles |
+| **BLINDSPOT app** | Phone / simulator | Camera, GPS, LiveKit client (mic + data), in-app obstacle (Gemini), haptics, TTS for obstacles |
 | **LiveKit** | Cloud (or self-hosted) | Real-time voice + data between app and agent |
 | **agent.py** | Your machine (via LiveKit) | Voice assistant: STT → LLM → TTS, navigation tools, obstacle voice alert, memory |
 
@@ -110,7 +110,7 @@ Optional variant: the app can **POST** camera frames to **your own obstacle serv
    - **Run:** `uv run python agent.py dev`  
    - **Config:** `.env.local` (see [CONFIG.md](CONFIG.md)) + **`agent_config.py`** (prompts, model, VAD, greeting).
 
-2. **Flutter app**  
+2. **BLINDSPOT app**  
    - **Run:** `flutter run` (device or simulator).  
    - **Config:** **`lib/config.dart`** (API keys, LiveKit, obstacle model/prompt/params).  
    - **Token:** Either **in-app** (set LiveKit URL + key + secret in `lib/config.dart`) or your own token server URL.
@@ -137,7 +137,7 @@ No separate token server or obstacle server is required: the app can generate th
 
 2. **App**  
    - Set LiveKit (and optional `GOOGLE_API_KEY` for in-app obstacle) in `lib/config.dart` or via `--dart-define`.  
-   - Run: `flutter run`.
+   - Run: `flutter run` (BLINDSPOT).
 
 3. On the phone: enable **voice** (mic) and optionally **obstacle** (camera → haptics + voice). Ask “Where am I?” or “Navigate to [address]” / “Take me to the nearest coffee shop.”
 
