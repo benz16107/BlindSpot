@@ -263,10 +263,12 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
     _obstacleTimer?.cancel();
     _obstacleTimer = null;
     _stopObstacleAlerts();
-    if (mounted) setState(() {
-      _obstacleNear = false;
-      _obstacleDescription = null;
-    });
+    if (mounted) {
+      setState(() {
+        _obstacleNear = false;
+        _obstacleDescription = null;
+      });
+    }
   }
 
   /// Constant haptic vibration while obstacle is detected.
@@ -298,8 +300,8 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
   void _onObstacleDetectionToggle() {
     HapticFeedback.selectionClick();
     if (_obstacleDetectionOn) {
-      _stopObstacleDetection();
       setState(() => _obstacleDetectionOn = false);
+      _stopObstacleDetection();
     } else {
       setState(() => _obstacleDetectionOn = true);
       _startObstacleDetection();
@@ -361,37 +363,44 @@ Reply with JSON only, no other text, with these exact keys:
       }
 
       if (!mounted || body == null) return;
+      if (!_obstacleDetectionOn) return;
       final detected = body['obstacle_detected'] == true;
       final distance = (body['distance'] as String? ?? '').toString().toLowerCase();
       final description = (body['description'] as String? ?? '').toString().trim();
       final isNear = detected && obstacleAlertDistances.contains(distance);
 
-      if (mounted) {
-        final wasNear = _obstacleNear;
-        setState(() {
-          _obstacleNear = isNear;
-          _obstacleDescription = isNear ? (description.isNotEmpty ? description : 'obstacle') : null;
-        });
-        if (isNear) {
-          _startObstacleAlerts(description.isNotEmpty ? description : 'object');
-          if (!wasNear) {
-            _announceObstacle(description.isNotEmpty ? description : 'object');
+      if (!mounted || !_obstacleDetectionOn) return;
+      final wasNear = _obstacleNear;
+      setState(() {
+        _obstacleNear = isNear;
+        _obstacleDescription = isNear ? (description.isNotEmpty ? description : 'obstacle') : null;
+      });
+      if (!_obstacleDetectionOn) return;
+      if (isNear) {
+        _startObstacleAlerts(description.isNotEmpty ? description : 'object');
+        final desc = description.isNotEmpty ? description : 'object';
+        final now = DateTime.now();
+        final shouldAnnounce = !wasNear ||
+            _lastObstacleAnnounceTime == null ||
+            now.difference(_lastObstacleAnnounceTime!) > _obstacleAnnounceCooldown;
+        if (shouldAnnounce) {
+          _lastObstacleAnnounceTime = now;
+          if (_voiceService.isConnected) {
+            _voiceService.publishObstacleDetected(desc);
           } else {
-            final now = DateTime.now();
-            if (_lastObstacleAnnounceTime == null ||
-                now.difference(_lastObstacleAnnounceTime!) > _obstacleAnnounceCooldown) {
-              _announceObstacle(description.isNotEmpty ? description : 'object');
-            }
+            _announceObstacle(desc);
           }
-        } else {
-          _stopObstacleAlerts();
         }
+      } else {
+        _stopObstacleAlerts();
       }
     } catch (_) {
-      if (mounted) setState(() {
-        _obstacleNear = false;
-        _obstacleDescription = null;
-      });
+      if (mounted && _obstacleDetectionOn) {
+        setState(() {
+          _obstacleNear = false;
+          _obstacleDescription = null;
+        });
+      }
     }
   }
 

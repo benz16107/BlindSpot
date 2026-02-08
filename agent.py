@@ -175,8 +175,16 @@ async def my_agent(ctx: agents.JobContext):
     def _on_data_received(packet):
         topic = getattr(packet, "topic", None) or ""
 
-        # Obstacle alerts are announced by the app (TTS only); no agent voice to avoid double announcement
+        # Obstacle: single voice — agent announces when app sends (only when obstacle button is on)
         if topic == OBSTACLE_DATA_TOPIC:
+            try:
+                payload = _json.loads(packet.data.decode("utf-8"))
+                desc = payload.get("obstacle") or "object"
+                phrase = f"Watch out. Obstacle detected. {desc} in front."
+                session.interrupt()
+                session.say(phrase)
+            except Exception as e:
+                logger.debug("Obstacle data_received: %s", e)
             return
 
         if topic != GPS_DATA_TOPIC:
@@ -213,7 +221,7 @@ async def my_agent(ctx: agents.JobContext):
             logger.debug(f"GPS data_received parse: {e}")
 
     room.on("data_received", _on_data_received)
-    logger.info("Subscribed to room data (topic=%s, %s)", GPS_DATA_TOPIC, OBSTACLE_ALERT_TOPIC)
+    logger.info("Subscribed to room data (topic=%s, %s)", GPS_DATA_TOPIC, OBSTACLE_DATA_TOPIC)
 
     def _on_participant_disconnected(participant):
         """When the phone disconnects, leave the room so next connect gets a fresh agent."""
