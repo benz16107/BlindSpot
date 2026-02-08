@@ -1,8 +1,8 @@
-      
+import asyncio
 from dotenv import load_dotenv
 
 from livekit import agents, rtc
-from livekit.agents import AgentServer, AgentSession, Agent, room_io
+from livekit.agents import AgentServer, AgentSession, Agent, room_io, ConversationItemAddedEvent
 from livekit.plugins import (
     google,
     # openai,  # Commented out - using Google Gemini instead
@@ -12,6 +12,7 @@ from livekit.plugins import (
 # from mcp_client import MCPServerSse
 from mcp_client import MCPServerHttp, MCPToolsIntegration   # or MCPServerStreamableHttp
 from backboard_store import init_backboard
+from google_maps import NavigationTool
 import os
 import logging
 
@@ -47,7 +48,7 @@ async def my_agent(ctx: agents.JobContext):
         logger.debug(f"Loaded context: {len(thread_history)} messages, {len(context_text)} chars")
     
     # 3. Create session with injected context
-    base_instructions = "You are my worst enemy, roast me as much as you can"
+    base_instructions = "You are a helpful voice AI assistant soley for the purpose of navigation for blind people.. You can use the tools provided to you to help the user (Zapier MCP Server)"
     
     if context_text:
         full_instructions = f"{base_instructions}\n\n{context_text}"
@@ -58,8 +59,29 @@ async def my_agent(ctx: agents.JobContext):
     session = AgentSession(
         llm=google.realtime.RealtimeModel(
             voice="Aoede", # Other options Puck (default), Kore (Femme), Charon, Fenrir, Aoede,
-        )
+        ),
+        # PTT Configuration: Helper can be interrupted (mutes when user speaks/presses button)
+        allow_interruptions=True,
     )
+
+    # Persist each user/assistant turn to Backboard so memory survives restarts
+    if memory_manager:
+
+        def on_conversation_item_added(event: ConversationItemAddedEvent):
+            text = (event.item.text_content or "").strip()
+            if not text:
+                return
+            role = (event.item.role or "").lower()
+            try:
+                loop = asyncio.get_running_loop()
+                if role == "user":
+                    loop.create_task(memory_manager.add_user_message(text))
+                elif role == "assistant":
+                    loop.create_task(memory_manager.add_assistant_message(text))
+            except RuntimeError:
+                pass  # No running loop (e.g. during shutdown)
+
+        session.on("conversation_item_added", on_conversation_item_added)
     
     # # Commented out: OpenAI Realtime Model (replaced with Google Gemini)
     # session = AgentSession(
@@ -92,6 +114,17 @@ async def my_agent(ctx: agents.JobContext):
         agent_kwargs={"instructions": full_instructions},
         memory_manager=memory_manager  # Pass memory manager to tools
     )
+
+    # Register Google Maps navigation tools so the agent can provide directions
+    nav_tool = NavigationTool()
+    if hasattr(agent, "_tools") and isinstance(agent._tools, list):
+        agent._tools.extend([
+            nav_tool.start_navigation,
+            nav_tool.update_location,
+            nav_tool.get_walking_directions,
+            nav_tool.search_places,
+        ])
+        logger.info("Registered Google Maps navigation tools with agent")
 
     await session.start(
         room=ctx.room,
