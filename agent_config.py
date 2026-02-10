@@ -23,7 +23,7 @@ STT_MODEL = "nova-2"
 STT_LANGUAGE = "en"
 
 # --- TTS (ElevenLabs). Override with env: ELEVEN_VOICE_ID, ELEVEN_MODEL ---
-TTS_VOICE_ID_DEFAULT = "EXAVITQu4vr4xnSDxMaL"
+TTS_VOICE_ID_DEFAULT = "EXAVITQu4vr4xnSDxMaL"  # Rachel (ElevenLabs premade)
 TTS_MODEL_DEFAULT = "eleven_multilingual_v2"
 
 # --- VAD (turn detection). Lower = faster response, higher = fewer false triggers ---
