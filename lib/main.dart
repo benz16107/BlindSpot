@@ -22,6 +22,13 @@ import 'package:image/image.dart' as img;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Edge-to-edge: draw behind status bar and nav bar so camera fills the screen
+  SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+  SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+    statusBarColor: Colors.transparent,
+    systemNavigationBarColor: Colors.transparent,
+    systemNavigationBarContrastEnforced: false,
+  ));
   List<CameraDescription> cameras = [];
   try {
     cameras = await availableCameras();
@@ -797,19 +804,19 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
     final controller = _controller;
 
     final showCamera = controller != null && controller.value.isInitialized;
+    final padding = MediaQuery.of(context).padding;
     return Scaffold(
-      body: SafeArea(
-        child: _initializing && controller == null
-            ? Container(
-                color: Colors.black,
-                alignment: Alignment.center,
-                child:
-                    Text(_status, style: const TextStyle(color: Colors.white)),
-              )
-            : Stack(
-                children: [
-                  Positioned.fill(
-                    child: showCamera
+      body: _initializing && controller == null
+          ? Container(
+              color: Colors.black,
+              alignment: Alignment.center,
+              child:
+                  Text(_status, style: const TextStyle(color: Colors.white)),
+            )
+          : Stack(
+              children: [
+                Positioned.fill(
+                  child: showCamera
                         ? ExcludeSemantics(
                             child: _CameraPreviewFullScreen(
                                 controller: controller),
@@ -836,13 +843,13 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                               ],
                             ),
                           ),
-                  ),
+                ),
 
-                  // Status + GPS overlay — iOS-style frosted card
+                  // Status + GPS overlay — inset by safe area (hole punch, status bar)
                   Positioned(
-                    left: 16,
-                    right: 16,
-                    top: 16,
+                    left: 16 + padding.left,
+                    right: 16 + padding.right,
+                    top: 16 + padding.top,
                     child: Semantics(
                       container: true,
                       label: _statusSummaryForAccessibility(),
@@ -850,10 +857,10 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                         padding: const EdgeInsets.symmetric(
                             horizontal: 16, vertical: 14),
                         decoration: BoxDecoration(
-                          color: Colors.black.withOpacity(0.45),
+                          color: Colors.black.withOpacity(0.68),
                           borderRadius: BorderRadius.circular(20),
                           border: Border.all(
-                              color: Colors.white.withOpacity(0.25), width: 1),
+                              color: Colors.white.withOpacity(0.4), width: 1),
                         ),
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
@@ -1162,11 +1169,11 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                     ),
                   ),
 
-                  // Bottom bar — vertical tall buttons (Obstacles on top, Voice below)
+                  // Bottom bar — inset by safe area (nav bar)
                   Positioned(
-                    left: 16,
-                    right: 16,
-                    bottom: 20,
+                    left: 16 + padding.left,
+                    right: 16 + padding.right,
+                    bottom: 20 + padding.bottom,
                     child: ClipRRect(
                       borderRadius: BorderRadius.circular(32),
                       child: BackdropFilter(
@@ -1175,154 +1182,164 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                           padding: const EdgeInsets.symmetric(
                               horizontal: 10, vertical: 10),
                           decoration: BoxDecoration(
-                            color: Colors.white.withOpacity(0.2),
+                            color: Colors.black.withOpacity(0.55),
                             borderRadius: BorderRadius.circular(32),
                             border: Border.all(
-                                color: Colors.white.withOpacity(0.3), width: 1),
+                                color: Colors.white.withOpacity(0.45), width: 1),
                             boxShadow: [
                               BoxShadow(
-                                color: Colors.black.withOpacity(0.2),
+                                color: Colors.black.withOpacity(0.35),
                                 blurRadius: 20,
                                 offset: const Offset(0, 8),
                               ),
                             ],
                           ),
-                          child: Column(
+                          child: Row(
                             mainAxisSize: MainAxisSize.min,
                             children: [
-                              // Obstacles — tall vertical button
-                              Semantics(
-                                label: _voiceService.isConnected
-                                    ? (_obstacleDetectionOn
-                                        ? 'Object detection. On. Double tap to turn off.'
-                                        : 'Object detection. Off. Double tap to turn on.')
-                                    : 'Object detection. Connect voice first.',
-                                hint: _voiceService.isConnected
-                                    ? 'Double tap to toggle obstacle alerts'
-                                    : null,
-                                button: true,
-                                enabled: _voiceService.isConnected,
-                                child: Material(
-                                  color: _obstacleDetectionOn &&
-                                          _voiceService.isConnected
-                                      ? Colors.orange.withOpacity(0.45)
-                                      : Colors.transparent,
-                                  borderRadius: BorderRadius.circular(26),
-                                  child: InkWell(
-                                    onTap: _voiceService.isConnected
-                                        ? _onObstacleDetectionToggle
-                                        : null,
+                              // Voice — left
+                              Expanded(
+                                child: Semantics(
+                                  label: _voiceConnecting
+                                      ? 'Voice agent. Connecting.'
+                                      : (_voiceService.isConnected
+                                          ? 'Voice agent. On. Double tap to disconnect.'
+                                          : 'Voice agent. Off. Double tap to connect.'),
+                                  hint: _voiceConnecting
+                                      ? null
+                                      : 'Double tap to turn voice assistant on or off',
+                                  button: true,
+                                  enabled: !_voiceConnecting,
+                                  child: Material(
+                                    color: _voiceService.isConnected &&
+                                            !_voiceConnecting
+                                        ? const Color(0xFF34C759).withOpacity(0.5)
+                                        : Colors.transparent,
                                     borderRadius: BorderRadius.circular(26),
-                                    child: Container(
-                                      width: double.infinity,
-                                      padding: const EdgeInsets.symmetric(
-                                          vertical: 32, horizontal: 20),
-                                      alignment: Alignment.center,
-                                      child: Row(
-                                        mainAxisAlignment:
-                                            MainAxisAlignment.center,
-                                        children: [
-                                          Icon(
-                                            Icons.warning_amber_rounded,
-                                            size: 36,
-                                            color: _voiceService.isConnected
-                                                ? (_obstacleDetectionOn
-                                                    ? Colors.white
-                                                    : Colors.white
-                                                        .withOpacity(0.85))
-                                                : Colors.white.withOpacity(0.4),
-                                          ),
-                                          const SizedBox(width: 12),
-                                          Text(
-                                            'Obstacles',
-                                            style: TextStyle(
-                                              fontSize: 22,
-                                              fontWeight: FontWeight.w600,
-                                              color: _voiceService.isConnected
-                                                  ? (_obstacleDetectionOn
-                                                      ? Colors.white
-                                                      : Colors.white
-                                                          .withOpacity(0.9))
-                                                  : Colors.white
-                                                      .withOpacity(0.4),
-                                            ),
-                                          ),
-                                        ],
+                                    child: InkWell(
+                                      onTap: _voiceConnecting
+                                          ? null
+                                          : _onVoiceButtonPressed,
+                                      borderRadius: BorderRadius.circular(26),
+                                      child: Container(
+                                        padding: const EdgeInsets.symmetric(
+                                            vertical: 48, horizontal: 16),
+                                        alignment: Alignment.center,
+                                        child: _voiceConnecting
+                                            ? const SizedBox(
+                                                width: 36,
+                                                height: 36,
+                                                child: CircularProgressIndicator(
+                                                  strokeWidth: 2.5,
+                                                  color: Colors.white,
+                                                ),
+                                              )
+                                            : Row(
+                                                mainAxisAlignment:
+                                                    MainAxisAlignment.center,
+                                                mainAxisSize: MainAxisSize.min,
+                                                children: [
+                                                  Icon(
+                                                    Icons.mic_rounded,
+                                                    size: 36,
+                                                    color:
+                                                        _voiceService.isConnected
+                                                            ? Colors.white
+                                                            : Colors.white
+                                                                .withOpacity(0.9),
+                                                  ),
+                                                  const SizedBox(width: 10),
+                                                  Flexible(
+                                                    child: Text(
+                                                      'Voice',
+                                                      overflow: TextOverflow.ellipsis,
+                                                      style: TextStyle(
+                                                        fontSize: 22,
+                                                        fontWeight: FontWeight.w600,
+                                                        color: _voiceService
+                                                                .isConnected
+                                                            ? Colors.white
+                                                            : Colors.white
+                                                                .withOpacity(0.9),
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
                                       ),
                                     ),
                                   ),
                                 ),
                               ),
                               Container(
-                                height: 1,
-                                margin: const EdgeInsets.symmetric(vertical: 8),
-                                color: Colors.white.withOpacity(0.25),
+                                width: 1,
+                                margin: const EdgeInsets.symmetric(horizontal: 6),
+                                color: Colors.white.withOpacity(0.4),
                               ),
-                              // Voice — tall vertical button
-                              Semantics(
-                                label: _voiceConnecting
-                                    ? 'Voice agent. Connecting.'
-                                    : (_voiceService.isConnected
-                                        ? 'Voice agent. On. Double tap to disconnect.'
-                                        : 'Voice agent. Off. Double tap to connect.'),
-                                hint: _voiceConnecting
-                                    ? null
-                                    : 'Double tap to turn voice assistant on or off',
-                                button: true,
-                                enabled: !_voiceConnecting,
-                                child: Material(
-                                  color: _voiceService.isConnected &&
-                                          !_voiceConnecting
-                                      ? const Color(0xFF34C759).withOpacity(0.5)
-                                      : Colors.transparent,
-                                  borderRadius: BorderRadius.circular(26),
-                                  child: InkWell(
-                                    onTap: _voiceConnecting
-                                        ? null
-                                        : _onVoiceButtonPressed,
+                              // Obstacles — right
+                              Expanded(
+                                child: Semantics(
+                                  label: _voiceService.isConnected
+                                      ? (_obstacleDetectionOn
+                                          ? 'Object detection. On. Double tap to turn off.'
+                                          : 'Object detection. Off. Double tap to turn on.')
+                                      : 'Object detection. Connect voice first.',
+                                  hint: _voiceService.isConnected
+                                      ? 'Double tap to toggle obstacle alerts'
+                                      : null,
+                                  button: true,
+                                  enabled: _voiceService.isConnected,
+                                  child: Material(
+                                    color: _obstacleDetectionOn &&
+                                            _voiceService.isConnected
+                                        ? Colors.orange.withOpacity(0.45)
+                                        : Colors.transparent,
                                     borderRadius: BorderRadius.circular(26),
-                                    child: Container(
-                                      width: double.infinity,
-                                      padding: const EdgeInsets.symmetric(
-                                          vertical: 32, horizontal: 20),
-                                      alignment: Alignment.center,
-                                      child: _voiceConnecting
-                                          ? const SizedBox(
-                                              width: 36,
-                                              height: 36,
-                                              child: CircularProgressIndicator(
-                                                strokeWidth: 2.5,
-                                                color: Colors.white,
-                                              ),
-                                            )
-                                          : Row(
-                                              mainAxisAlignment:
-                                                  MainAxisAlignment.center,
-                                              children: [
-                                                Icon(
-                                                  Icons.mic_rounded,
-                                                  size: 36,
-                                                  color:
-                                                      _voiceService.isConnected
+                                    child: InkWell(
+                                      onTap: _voiceService.isConnected
+                                          ? _onObstacleDetectionToggle
+                                          : null,
+                                      borderRadius: BorderRadius.circular(26),
+                                      child: Container(
+                                        padding: const EdgeInsets.symmetric(
+                                            vertical: 48, horizontal: 16),
+                                        alignment: Alignment.center,
+                                        child: Row(
+                                          mainAxisAlignment:
+                                              MainAxisAlignment.center,
+                                          mainAxisSize: MainAxisSize.min,
+                                          children: [
+                                            Icon(
+                                              Icons.warning_amber_rounded,
+                                              size: 36,
+                                              color: _voiceService.isConnected
+                                                  ? (_obstacleDetectionOn
+                                                      ? Colors.white
+                                                      : Colors.white
+                                                          .withOpacity(0.85))
+                                                  : Colors.white.withOpacity(0.4),
+                                            ),
+                                            const SizedBox(width: 10),
+                                            Flexible(
+                                              child: Text(
+                                                'Obstacles',
+                                                overflow: TextOverflow.ellipsis,
+                                                style: TextStyle(
+                                                  fontSize: 22,
+                                                  fontWeight: FontWeight.w600,
+                                                  color: _voiceService.isConnected
+                                                      ? (_obstacleDetectionOn
                                                           ? Colors.white
                                                           : Colors.white
-                                                              .withOpacity(0.9),
+                                                              .withOpacity(0.9))
+                                                      : Colors.white
+                                                          .withOpacity(0.4),
                                                 ),
-                                                const SizedBox(width: 12),
-                                                Text(
-                                                  'Voice',
-                                                  style: TextStyle(
-                                                    fontSize: 22,
-                                                    fontWeight: FontWeight.w600,
-                                                    color: _voiceService
-                                                            .isConnected
-                                                        ? Colors.white
-                                                        : Colors.white
-                                                            .withOpacity(0.9),
-                                                  ),
-                                                ),
-                                              ],
+                                              ),
                                             ),
+                                          ],
+                                        ),
+                                      ),
                                     ),
                                   ),
                                 ),
@@ -1333,9 +1350,8 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                       ),
                     ),
                   ),
-                ],
-              ),
-      ),
+              ],
+            ),
     );
   }
 }
