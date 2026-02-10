@@ -107,7 +107,8 @@ Optional variant: the app can **POST** camera frames to **your own obstacle serv
 ## What you need to run
 
 1. **agent.py** (voice backend)  
-   - **Run:** `uv run python agent.py dev`  
+   - **For phone/simulator:** `./run_agent.sh` or `uv run agent.py dev` — registers with LiveKit so the app can connect.
+   - **For local mic/speaker testing only:** `uv run agent.py console` — does not connect to LiveKit; phone will not get agent response.
    - **Config:** `.env.local` (see [CONFIG.md](CONFIG.md)) + **`agent_config.py`** (prompts, model, VAD, greeting).
 
 2. **BLINDSPOT app**  
@@ -131,9 +132,9 @@ No separate token server or obstacle server is required: the app can generate th
 
 ## Getting started
 
-1. **Backend**  
+1. **Backend (required for phone)**  
    - Copy `.env.local.template` → `.env.local` and fill in keys (see [CONFIG.md](CONFIG.md)).  
-   - Run: `uv run python agent.py dev`.
+   - Run: `./run_agent.sh` or `uv run agent.py dev` (use `console` only for local mic/speaker testing).
 
 2. **App**  
    - Set LiveKit (and optional `GOOGLE_API_KEY` for in-app obstacle) in `lib/config.dart` or via `--dart-define`.  

@@ -8,7 +8,7 @@ from typing import Optional
 import googlemaps
 import requests
 from livekit.agents import llm
-from navigation import NavigationSession
+from navigation import NavigationSession, _rewrite_instruction_with_heading
 from google.genai import Client
 from google.genai import types
 
@@ -228,7 +228,15 @@ class NavigationTool:
             if legs:
                 steps = legs[0].get("steps", [])
                 if steps:
-                    first_instruction = self.session._clean_instruction(steps[0].get('html_instructions', 'Proceed to route'))
+                    raw_first = self.session._clean_instruction(steps[0].get('html_instructions', 'Proceed to route'))
+                    # Enhance with compass: "Head left onto X, that's west"
+                    if self._latest_lat is not None and self._latest_lng is not None:
+                        first_instruction = _rewrite_instruction_with_heading(
+                            raw_first, self._latest_heading,
+                            self._latest_lat, self._latest_lng, steps[0]
+                        )
+                    else:
+                        first_instruction = raw_first
                     return f"{destination_confirm}{summary_announcement} First direction: {first_instruction}"
             return f"{destination_confirm}{summary_announcement} Proceed to the route."
             
@@ -243,17 +251,18 @@ class NavigationTool:
                 )
             return f"Error starting navigation: {err_msg}"
 
-    @llm.function_tool(description="Update user location (latitude, longitude) for navigation tracking. Call when you receive the user's current GPS coordinates to get the next turn instruction.")
+    @llm.function_tool(description="Update user location (latitude, longitude) for navigation tracking. Call when you receive the user's current GPS coordinates to get the next turn instruction. Uses phone compass heading when available to announce 'head forward/left/right/behind' and cardinal direction (north, south, east, west).")
     async def update_location(self, lat: float, lng: float) -> str:
         """
         Updates the user's location. Returns an instruction only when approaching a turn
         (within ~45m warning or ~12m "Now"); otherwise returns empty string so the agent
         does not announce anything (no repeated "continue on route").
+        Uses phone compass (_latest_heading) to say "Head left, that's west" etc.
         """
         if not self.session.active_route:
             return "Navigation not active."
 
-        instruction = self.session.update_location(lat, lng)
+        instruction = self.session.update_location(lat, lng, self._latest_heading)
         if instruction:
             return instruction
         # No turn to announce – return empty so the agent does not speak
