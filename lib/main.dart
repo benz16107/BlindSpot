@@ -379,11 +379,16 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
       });
       _voiceService.updateGps(first.latitude, first.longitude, _heading);
 
-      // 4) Compass updates (heading 0–360)
+      // 4) Compass updates (heading 0–360) — push to agent so nav uses current direction
       _compassSub?.cancel();
       _compassSub = FlutterCompass.events?.listen((CompassEvent e) {
         if (!mounted) return;
-        if (e.heading != null) setState(() => _heading = e.heading);
+        if (e.heading != null) {
+          setState(() => _heading = e.heading);
+          if (_pos != null) {
+            _voiceService.updateGps(_pos!.latitude, _pos!.longitude, e.heading!);
+          }
+        }
       });
 
       // 5) Continuous position updates while camera screen is open
@@ -1357,6 +1362,8 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
 }
 
 /// Full-screen camera preview at native aspect ratio (covers screen, no stretch).
+/// Uses buildPreview() + FittedBox so the texture gets explicit dimensions
+/// and scales correctly without stretching.
 class _CameraPreviewFullScreen extends StatelessWidget {
   final CameraController controller;
 
@@ -1364,31 +1371,40 @@ class _CameraPreviewFullScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final ar = controller.value.aspectRatio;
-    if (ar <= 0) {
+    if (!controller.value.isInitialized) {
       return const Center(
           child: CircularProgressIndicator(color: Colors.white));
     }
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final maxW = constraints.maxWidth;
-        final maxH = constraints.maxHeight;
-        // Size (w, h) with w/h = ar that covers maxW x maxH
-        final h = maxH > maxW / ar ? maxH : maxW / ar;
-        final w = ar * h;
-        return Container(
-          color: Colors.black,
-          child: ClipRect(
-            child: Center(
-              child: SizedBox(
-                width: w,
-                height: h,
-                child: CameraPreview(controller),
-              ),
-            ),
+
+    final orientation = MediaQuery.of(context).orientation;
+    final previewSize = controller.value.previewSize;
+
+    if (previewSize == null) {
+      return const Center(
+          child: CircularProgressIndicator(color: Colors.white));
+    }
+
+    // Camera sensor is landscape; swap for portrait so preview matches device
+    final w = orientation == Orientation.portrait
+        ? previewSize.height
+        : previewSize.width;
+    final h = orientation == Orientation.portrait
+        ? previewSize.width
+        : previewSize.height;
+
+    return Container(
+      color: Colors.black,
+      child: ClipRect(
+        child: FittedBox(
+          fit: BoxFit.cover,
+          alignment: Alignment.center,
+          child: SizedBox(
+            width: w,
+            height: h,
+            child: controller.buildPreview(),
           ),
-        );
-      },
+        ),
+      ),
     );
   }
 }
