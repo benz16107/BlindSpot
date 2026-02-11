@@ -46,8 +46,8 @@ bool get useLocalLiveKitToken =>
 // OBSTACLE DETECTION (camera frames → agent → OpenAI gpt-4o-mini vision)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// How often to capture and send a frame to the agent (ms). Lower = faster response.
-const int obstacleCheckIntervalMs = 400;
+/// How often to capture and send a frame to the agent (ms). Higher = smoother preview, slower detection.
+const int obstacleCheckIntervalMs = 800;
 
 /// Max width for resized JPEG. Keep under ~10KB raw for LiveKit (14KB payload limit).
 /// 256 gives HOG/YOLO enough resolution to detect; test_obstacle_local uses full frame (~640px).

@@ -1,11 +1,12 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:camera/camera.dart';
 import 'package:image/image.dart' as img;
-import 'package:flutter/foundation.dart' show kIsWeb, debugPrint;
+import 'package:flutter/foundation.dart' show kIsWeb, debugPrint, compute;
 import 'package:flutter/material.dart';
 import 'package:flutter/semantics.dart';
 import 'package:flutter/services.dart';
@@ -17,6 +18,37 @@ import 'package:record/record.dart';
 import 'config.dart';
 import 'voice_service.dart';
 import 'package:flutter_tts/flutter_tts.dart';
+
+/// Runs in background isolate to avoid blocking the camera preview.
+Uint8List? _resizeObstacleImageIsolate(Uint8List jpegBytes) {
+  const maxBytes = 10000;
+  try {
+    final decoded = img.decodeImage(jpegBytes);
+    if (decoded == null) return null;
+    final w = decoded.width;
+    final h = decoded.height;
+    final cropW = (w * 0.8).round();
+    final cropH = (h * 0.8).round();
+    final x = (w - cropW) ~/ 2;
+    final y = (h - cropH) ~/ 2;
+    final cropped =
+        img.copyCrop(decoded, x: x, y: y, width: cropW, height: cropH);
+    final scale = obstacleImageMaxWidth / cropped.width;
+    final resized = img.copyResize(
+      cropped,
+      width: obstacleImageMaxWidth,
+      height: (cropped.height * scale).round(),
+    );
+    for (final q in [obstacleJpegQuality, 35, 25, 20, 15]) {
+      final encoded = img.encodeJpg(resized, quality: q);
+      final bytes = Uint8List.fromList(encoded);
+      if (bytes.length <= maxBytes) return bytes;
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -542,7 +574,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
     try {
       final XFile file = await controller.takePicture();
       final bytes = await file.readAsBytes();
-      final resized = _resizeObstacleImage(bytes);
+      final resized = await compute(_resizeObstacleImageIsolate, bytes);
       if (resized == null || resized.isEmpty) return;
       final base64 = base64Encode(resized);
       _voiceService.publishObstacleFrame(base64);
@@ -552,40 +584,6 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
     }
   }
 
-  /// LiveKit payload limit ~14KB; JSON wrapper + base64 adds overhead.
-  /// Target ~9KB raw JPEG so base64 + wrapper stays under 14KB.
-  static const int _obstacleMaxRawJpegBytes = 10000;
-
-  Uint8List? _resizeObstacleImage(Uint8List jpegBytes) {
-    try {
-      final decoded = img.decodeImage(jpegBytes);
-      if (decoded == null) return null;
-      // Center-crop to ~80% so path ahead uses more of the pixels we send
-      final w = decoded.width;
-      final h = decoded.height;
-      final cropW = (w * 0.8).round();
-      final cropH = (h * 0.8).round();
-      final x = (w - cropW) ~/ 2;
-      final y = (h - cropH) ~/ 2;
-      final cropped =
-          img.copyCrop(decoded, x: x, y: y, width: cropW, height: cropH);
-      final scale = obstacleImageMaxWidth / cropped.width;
-      final resized = img.copyResize(
-        cropped,
-        width: obstacleImageMaxWidth,
-        height: (cropped.height * scale).round(),
-      );
-      // Try quality down until under limit (phone cameras produce larger JPEGs)
-      for (final q in [obstacleJpegQuality, 35, 25, 20, 15]) {
-        final encoded = img.encodeJpg(resized, quality: q);
-        final bytes = Uint8List.fromList(encoded);
-        if (bytes.length <= _obstacleMaxRawJpegBytes) return bytes;
-      }
-      return null;
-    } catch (_) {
-      return null;
-    }
-  }
 
   void _onObstacleDetectionToggle() {
     HapticFeedback.selectionClick();

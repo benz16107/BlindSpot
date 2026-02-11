@@ -7,15 +7,12 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
-# Load .env.local from project root (where this file lives). Required when the agent
-# runs in a worker process whose current working directory is not the project root.
 _env_path = Path(__file__).resolve().parent / ".env.local"
 load_dotenv(_env_path)
 
 from livekit import agents, rtc
 from livekit.agents import AgentServer, AgentSession, Agent, room_io, ConversationItemAddedEvent
 from livekit.plugins import (
-    deepgram,
     google,
     elevenlabs,
     noise_cancellation,
@@ -50,9 +47,8 @@ server = AgentServer()
 async def my_agent(ctx: agents.JobContext):
     room_name = getattr(ctx.room, "name", None) or "unknown"
     logger.info("Agent job started for room=%s", room_name)
-    # Obstacle detection uses OpenCV (no API key required)
 
-    # 1. Initialize Backboard (optional memory)
+    # Initialize Backboard (optional memory)
     try:
         memory_manager = await init_backboard()
         if memory_manager:
@@ -61,21 +57,19 @@ async def my_agent(ctx: agents.JobContext):
         logger.error(f"Failed to initialize Backboard: {e}")
         memory_manager = None
 
-    # 2. Load thread history (from agent_config)
     context_text = ""
     if memory_manager:
         thread_history = await memory_manager.load_thread_history(limit=cfg.MEMORY_HISTORY_LIMIT)
         context_text = memory_manager.format_context_for_llm(thread_history)
         logger.debug(f"Loaded context: {len(thread_history)} messages, {len(context_text)} chars")
 
-    # 3. Instructions from agent_config
     full_instructions = f"{cfg.AGENT_BASE_INSTRUCTIONS}\n\n{context_text}".strip() if context_text else cfg.AGENT_BASE_INSTRUCTIONS
 
     eleven_key = os.environ.get("ELEVEN_API_KEY", "").strip()
     if not eleven_key:
-        logger.warning("ELEVEN_API_KEY is not set; ElevenLabs TTS will fail (no audio frames)")
+        logger.warning("ELEVEN_API_KEY is not set; ElevenLabs STT and TTS will fail")
     session = AgentSession(
-        stt=deepgram.STT(model=cfg.STT_MODEL, language=cfg.STT_LANGUAGE),
+        stt=elevenlabs.STT(model_id=cfg.STT_MODEL, language_code=cfg.STT_LANGUAGE),
         llm=google.LLM(
             model=cfg.LLM_MODEL,
             thinking_config=types.ThinkingConfig(thinking_budget=cfg.THINKING_BUDGET),
@@ -94,7 +88,6 @@ async def my_agent(ctx: agents.JobContext):
         allow_interruptions=True,
     )
 
-    # Persist each user/assistant turn to Backboard so memory survives restarts
     if memory_manager:
 
         def on_conversation_item_added(event: ConversationItemAddedEvent):
@@ -109,7 +102,7 @@ async def my_agent(ctx: agents.JobContext):
                 elif role == "assistant":
                     loop.create_task(memory_manager.add_assistant_message(text))
             except RuntimeError:
-                pass  # No running loop (e.g. during shutdown)
+                pass
 
         session.on("conversation_item_added", on_conversation_item_added)
 
@@ -117,7 +110,6 @@ async def my_agent(ctx: agents.JobContext):
     if not getattr(agent, "_tools", None) or not isinstance(agent._tools, list):
         agent._tools = []
 
-    # Register Google Maps navigation tools
     nav_tool = NavigationTool()
     if nav_tool.client:
         logger.info("Google Maps API key loaded; navigation tools enabled")
@@ -135,16 +127,11 @@ async def my_agent(ctx: agents.JobContext):
         ])
         logger.info("Registered Google Maps navigation tools with agent")
 
-    # Use constantly updating GPS from the phone. Client should publish JSON { "lat": <float>, "lng": <float> } with topic "gps".
     room = ctx.room
-
-    # App mode: navigation on/off, obstacles on/off (for greeting)
-    # Default to False — if no mode data arrives we must NOT say the nav greeting
     app_navigation_enabled = False
     app_obstacles_enabled = False
     greeting_said = False
 
-    # Obstacle processor: receives frames from app, runs OpenCV detection
     obstacle_processor: Optional[ObstacleProcessor] = None
     obstacle_frames_received = 0
 
@@ -162,7 +149,6 @@ async def my_agent(ctx: agents.JobContext):
 
     async def _on_obstacle_detected(description: str, is_new: bool) -> None:
         await _publish_obstacle(True, description)
-        # During nav grace period (summary + first direction), don't speak obstacle; haptics only.
         if is_new and not nav_tool.session.is_in_initial_nav_phase():
             try:
                 phrase = cfg.OBSTACLE_PHRASE_TEMPLATE.format(description=description)
@@ -264,8 +250,6 @@ async def my_agent(ctx: agents.JobContext):
                 obstacle_frames_received += 1
                 if obstacle_frames_received <= 3 or obstacle_frames_received % 20 == 0:
                     logger.info("obstacle-frame received (total=%d, payload_len=%d)", obstacle_frames_received, len(data))
-                # Start processor on first frame if app requested obstacles, OR whenever we get frames
-                # (handles race: obstacle-mode may have been sent before agent joined)
                 if not obstacle_processor:
                     app_obstacles_enabled = True
                     _start_obstacle_processor()
@@ -279,7 +263,6 @@ async def my_agent(ctx: agents.JobContext):
     logger.info("Subscribed to room data (topics: gps, app-mode, obstacle-mode, obstacle-frame)")
 
     def _on_participant_disconnected(participant):
-        """When the phone disconnects, leave the room so next connect gets a fresh agent."""
         _stop_obstacle_processor()
         logger.info("Participant %s left; agent leaving room so next connect gets a new session", participant.identity)
 
@@ -298,8 +281,8 @@ async def my_agent(ctx: agents.JobContext):
 
     async def say_greeting():
         nonlocal greeting_said
-        # Wait long enough for Flutter to send (and retry) app-mode / obstacle-mode
-        await asyncio.sleep(4.0)
+        delay = max(2.0, cfg.GREETING_DELAY_SECONDS or 2)
+        await asyncio.sleep(delay)
         if greeting_said:
             return
         greeting_said = True
@@ -307,14 +290,11 @@ async def my_agent(ctx: agents.JobContext):
             if app_obstacles_enabled and not app_navigation_enabled:
                 logger.info("Greeting: obstacles-only mode")
                 await session.say("Object detection on. Point the camera ahead.")
-            elif app_navigation_enabled:
+            else:
                 logger.info("Greeting: navigation mode")
                 await session.say(cfg.GREETING_PHRASE)
-            else:
-                # No mode data arrived at all — stay silent
-                logger.info("Greeting: no mode data received, skipping")
         except Exception as e:
-            logger.debug("Greeting say: %s", e)
+            logger.warning("Greeting say failed: %s", e)
 
     asyncio.create_task(say_greeting())
     await session.start(
