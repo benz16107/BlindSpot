@@ -32,8 +32,24 @@ COCO_NAMES = (
     "scissors", "teddy bear", "hair drier", "toothbrush",
 )
 
-# Classes we care about as "obstacles in path" (person, vehicles, furniture, etc.)
-OBSTACLE_CLASS_IDS = {0, 1, 2, 3, 4, 5, 6, 7, 8, 13, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 72, 73}
+# Classes we care about as "obstacles in path" (person, vehicles, street furniture, animals, etc.)
+# COCO indices: 0 person, 1 bicycle, 2 car, 3 motorcycle, 4 airplane, 5 bus, 6 train, 7 truck, 8 boat
+# 9 traffic light, 10 fire hydrant, 11 stop sign, 12 parking meter, 13 bench
+# 14 bird, 15 cat, 16 dog, 17 horse, 24 backpack, 25 umbrella, 26 handbag, 28 suitcase
+# 36 skateboard, 39 bottle, 41 cup, 45 bowl
+# 56 chair, 57 couch, 58 potted plant, 59 bed, 60 dining table, 61 toilet
+# 62 tv, 63 laptop, 64 mouse, 65 remote, 66 keyboard, 67 cell phone
+# 68 microwave, 70 toaster, 71 sink, 72 refrigerator, 73 book, 74 clock, 75 vase, 76 scissors, 77 teddy bear
+OBSTACLE_CLASS_IDS = {
+    0, 1, 2, 3, 4, 5, 6, 7, 8,       # person, vehicles
+    9, 10, 11, 12, 13,                # traffic light, fire hydrant, stop sign, parking meter, bench
+    14, 15, 16, 17,                   # bird, cat, dog, horse
+    24, 25, 26, 28,                   # backpack, umbrella, handbag, suitcase
+    36, 39, 41, 45,                   # skateboard, bottle, cup, bowl
+    56, 57, 58, 59, 60, 61,           # chair, couch, potted plant, bed, dining table, toilet
+    62, 63, 64, 65, 66, 67,           # tv, laptop, mouse, remote, keyboard, cell phone
+    68, 70, 71, 72, 73, 74, 75, 76, 77,  # microwave, toaster, sink, refrigerator, book, clock, vase, scissors, teddy bear
+}
 
 # Center region: fraction of image that counts as "path ahead" (wider for phone/camera)
 CENTER_X_FRAC = (0.2, 0.8)   # middle 60% horizontally

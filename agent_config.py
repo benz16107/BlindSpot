@@ -26,7 +26,7 @@ STT_MODEL = "scribe_v2_realtime"
 STT_LANGUAGE = "en"
 
 # --- TTS ---
-TTS_VOICE_ID_DEFAULT = "pNInz6obpgDQGcFmaJgB"  # Adam (ElevenLabs premade)
+TTS_VOICE_ID_DEFAULT = "EXAVITQu4vr4xnSDxMaL"  # Sarah (ElevenLabs premade)
 TTS_MODEL_DEFAULT = "eleven_multilingual_v2"
 
 # --- VAD (turn detection). Lower = faster response, higher = fewer false triggers ---
