@@ -67,7 +67,6 @@
 ## Architecture
 
 ```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {'fontSize': '20px'}}}%%
 flowchart TB
     subgraph Phone["📱 Phone (Flutter)"]
         Mic[Microphone]
