@@ -1,6 +1,6 @@
 # BlindSpot
 
-**BlindSpot** is a Flutter app for assistive walking navigation: live camera, GPS, **voice agent** (turn-by-turn, “where am I?”, nearby search), and **obstacle detection** (OpenCV, haptics + voice). Built for blind and low-vision users.
+**BlindSpot** is a Flutter app for assistive walking navigation: live camera, GPS, **voice agent** (turn-by-turn, “where am I?”, nearby search), and **obstacle detection** (OpenCV, haptics + voice). Built for blind and low-vision users. Watch the demo: https://youtu.be/aTPlUJunyck?si=NmVp9Ja6pA11pjKy 
 
 ---
 
