@@ -1,6 +1,51 @@
 # BLINDSPOT
 
-**BLINDSPOT** is a Flutter app for assistive walking navigation: live camera, GPS, **voice agent** (turn-by-turn, “where am I?”, nearby search), **obstacle detection** (OpenCV, haptics + voice). Built for blind and low-vision users.
+**BLINDSPOT** is a Flutter app for assistive walking navigation: live camera, GPS, **voice agent** (turn-by-turn, “where am I?”, nearby search), and **obstacle detection** (OpenCV, haptics + voice). Built for blind and low-vision users.
+
+---
+
+## Quick start
+
+**Both processes must run at the same time.** Use two terminals:
+
+| Terminal | Command | Purpose |
+|----------|---------|---------|
+| **1** | `./run_agent.sh` | Voice agent + obstacle detection (connects to LiveKit) |
+| **2** | `./run_app.sh` | Flutter app (phone or simulator) |
+
+**Before first run:** Copy `.env.local.template` → `.env.local` and add your API keys. See [CONFIG.md](CONFIG.md) for details.
+
+---
+
+## Prerequisites
+
+- **Flutter** (for the app)
+- **Python 3.10+** with **uv** (`pip install uv` or see [uv docs](https://github.com/astral-sh/uv))
+- **Accounts:** [LiveKit Cloud](https://cloud.livekit.io/) (free tier), [Google AI](https://aistudio.google.com/) (Gemini), [Deepgram](https://deepgram.com/), [ElevenLabs](https://elevenlabs.io/), [Google Maps](https://console.cloud.google.com/) (Directions + Places APIs)
+
+---
+
+## Getting started (detailed)
+
+1. **Configure**
+   - Copy `.env.local.template` → `.env.local`
+   - Fill in all required keys (see [CONFIG.md](CONFIG.md))
+
+2. **Start the agent** (Terminal 1)
+   ```bash
+   ./run_agent.sh
+   ```
+   Keeps running. Registers with LiveKit so the app can connect.
+
+3. **Start the app** (Terminal 2)
+   ```bash
+   ./run_app.sh
+   ```
+   Choose your device (phone or simulator).
+
+4. **Use the app**
+   - Tap **Navigation** to connect and enable voice. Ask “Where am I?” or “Navigate to [address]”.
+   - Double-tap **Obstacle** to enable object detection. Point the camera ahead; you’ll get haptics + voice when something is detected.
 
 ---
 
@@ -8,152 +53,75 @@
 
 | Path | Purpose |
 |------|---------|
-| `agent.py` | Voice agent (LiveKit worker) |
-| `agent_config.py` | Prompts, LLM/STT/TTS/VAD |
-| `obstacle.py` | Obstacle detection (OpenCV) |
-| `google_maps.py`, `navigation.py` | Navigation |
-| `backboard_store.py` | Memory |
-| `scripts/download_yolov8n_onnx.py` | Export YOLOv8n ONNX |
+| `agent.py` | Voice agent (LiveKit worker): STT → LLM → TTS, navigation, obstacle detection |
+| `agent_config.py` | Prompts, LLM/STT/TTS/VAD settings |
+| `obstacle.py` | Obstacle detection (OpenCV HOG or YOLOv8n ONNX) |
+| `google_maps.py`, `navigation.py` | Navigation tools |
+| `backboard_store.py` | Memory (optional) |
+| `scripts/download_yolov8n_onnx.py` | Download YOLOv8n ONNX for better detection |
+| `test_obstacle_local.py` | Test obstacle detection locally (no LiveKit) |
 | `lib/` | Flutter app |
+
+---
 
 ## Architecture
 
-Data flow:
-
-```mermaid
-flowchart TB
-  subgraph phone["📱 Phone (BLINDSPOT app)"]
-    UI[UI: camera preview, buttons]
-    CAM[Camera]
-    GPS[GPS + Compass]
-    MIC[Microphone]
-    SPEAKER[Speaker]
-    HAPTIC[Haptics]
-    VOICE_SVC[VoiceService]
-  end
-
-  subgraph cloud["☁️ LiveKit"]
-    ROOM[Room]
-  end
-
-  subgraph server["🖥️ Your computer"]
-    AGENT[agent.py]
-  end
-
-  subgraph agent_internals["Agent"]
-    STT[Deepgram STT]
-    LLM[Gemini LLM]
-    TTS_EL[ElevenLabs TTS]
-    OBST[OpenCV obstacle]
-    TOOLS[Navigation, Backboard]
-  end
-
-  subgraph apis["External APIs"]
-    GMAPS[Google Maps]
-    DEEP[Deepgram]
-    GEMINI[Gemini]
-    ELEVEN[ElevenLabs]
-    BACK[Backboard]
-  end
-
-  UI --> CAM
-  UI --> GPS
-  UI --> MIC
-  UI --> VOICE_SVC
-  CAM -->|frames| VOICE_SVC
-  VOICE_SVC -->|obstacle-frame| ROOM
-  ROOM -->|frame| AGENT
-  AGENT --> OBST
-  AGENT -->|obstacle| ROOM
-  ROOM -->|obstacle| VOICE_SVC
-  VOICE_SVC --> HAPTIC
-  VOICE_SVC --> SPEAKER
-
-  MIC -->|audio| VOICE_SVC
-  VOICE_SVC <-->|WebSocket: audio + data| ROOM
-  GPS -->|lat, lng, heading| VOICE_SVC
-  VOICE_SVC -->|topic: gps| ROOM
-  VOICE_SVC -->|topic: obstacle| ROOM
-
-  ROOM <-->|audio + data| AGENT
-  AGENT --> STT
-  STT --> LLM
-  LLM --> TOOLS
-  TOOLS --> GMAPS
-  TOOLS --> BACK
-  LLM --> TTS_EL
-  TTS_EL --> ROOM
-  ROOM --> SPEAKER
-
-  STT --> DEEP
-  LLM --> GEMINI
-  TTS_EL --> ELEVEN
-  GMAPS --> apis
+```
+┌─────────────────────┐     ┌─────────────────────┐     ┌─────────────────────┐
+│   Phone (Flutter)    │     │   LiveKit Cloud      │     │   Your computer      │
+│                     │     │                     │     │   (agent.py)          │
+│  Mic ───────────────┼────►│                     │◄───►│   STT → LLM → TTS     │
+│  GPS (topic: gps) ──┼────►│   Room               │     │   OpenCV obstacle     │
+│  Camera (obstacle-  │     │                     │     │   Google Maps tools   │
+│  frame) ───────────┼────►│                     │     │                       │
+│                     │◄────│                     │◄────│  obstacle results     │
+│  Speaker ◄──────────┼─────│                     │─────│  TTS audio            │
+└─────────────────────┘     └─────────────────────┘     └─────────────────────┘
 ```
 
-**In words:**
+**Data flow:**
 
 | From | To | What |
 |------|----|------|
-| **Phone** | **LiveKit** | Microphone audio, GPS (topic `gps`), obstacle alerts when near (topic `obstacle`) |
-| **LiveKit** | **Phone** | Agent’s voice (TTS audio) |
-| **LiveKit** | **agent.py** | When the app joins a room, LiveKit runs your worker; it joins the same room and gets mic + data |
-| **agent.py** | **LiveKit** | Synthesized speech (ElevenLabs) and any “say” (e.g. turn-by-turn, obstacle phrase) |
-| **Phone** | **LiveKit** | Camera frame (obstacle mode) → agent |
-| **agent.py** | **OpenCV** | Frames → HOG or YOLOv8n ONNX (no API key) → obstacle result |
-| **agent.py** | **APIs** | Deepgram (STT), Gemini (LLM), ElevenLabs (TTS), Google Maps (navigation), Backboard (memory), optional Zapier |
+| **Phone** | **LiveKit** | Microphone audio, GPS (topic `gps`), camera frames (topic `obstacle-frame`) |
+| **Agent** | **LiveKit** | Synthesized speech (TTS), obstacle results (topic `obstacle`) |
+| **LiveKit** | **Phone** | Agent’s voice, obstacle alerts (haptics + optional voice) |
+| **Agent** | **APIs** | Deepgram (STT), Gemini (LLM), ElevenLabs (TTS), Google Maps (navigation) |
+
+No token server needed: the app generates the LiveKit token in-app using keys from `.env.local`.
 
 ---
 
-## Component overview
-
-| Component | Runs on | Role |
-|-----------|---------|------|
-| **BLINDSPOT app** | Phone / simulator | Camera, GPS, LiveKit client (mic + data), obstacle frames to agent, haptics, TTS for obstacles |
-| **LiveKit** | Cloud (or self-hosted) | Real-time voice + data between app and agent |
-| **agent.py** | Your machine (via LiveKit) | Voice assistant: STT → LLM → TTS, navigation tools, obstacle voice alert, memory |
-
----
-
-## What you need to run
-
-1. **agent.py** (voice backend)  
-   - **For phone/simulator:** `./run_agent.sh` or `uv run agent.py dev` — registers with LiveKit so the app can connect.
-   - **For local mic/speaker testing only:** `uv run agent.py console` — does not connect to LiveKit; phone will not get agent response.
-   - **Config:** `.env.local` (see [CONFIG.md](CONFIG.md)) + **`agent_config.py`** (prompts, model, VAD, greeting).
-
-2. **BLINDSPOT app**  
-   - **Run:** `./run_app.sh` (loads keys from `.env.local`; plain `flutter run` does not pass keys).  
-   - **Config:** All keys in **`.env.local`**; **`lib/config.dart`** for obstacle params only.  
-   - **Token:** In-app (LiveKit URL/key/secret come from `.env.local` via `run_app.sh`).
-
-No separate token server is required: the app can generate the LiveKit token itself. Obstacle detection runs on the agent using OpenCV (no API key).
-
----
-
-## Configuration at a glance
+## Configuration
 
 | What | Where |
-|------|--------|
-| **All API keys** (what they’re for, where to set them) | [CONFIG.md](CONFIG.md) |
-| **Voice agent** (instructions, LLM/STT/TTS, VAD, greeting) | **`agent_config.py`** |
-| **Object detection** (model, prompt, interval, sensitivity) | **`lib/config.dart`** |
+|------|------|
+| **API keys** (LiveKit, Google, Deepgram, ElevenLabs, etc.) | [CONFIG.md](CONFIG.md) |
+| **Voice agent** (instructions, models, VAD, greeting) | `agent_config.py` |
+| **Object detection** (interval, image size, sensitivity) | `lib/config.dart` |
+| **Obstacle model** (HOG vs YOLOv8n, classes) | `obstacle.py` |
 
 ---
 
-## Getting started
+## Troubleshooting
 
-1. **Backend (required for phone)**  
-   - Copy `.env.local.template` → `.env.local` and fill in keys (see [CONFIG.md](CONFIG.md)).  
-   - Run: `./run_agent.sh` or `uv run agent.py dev` (use `console` only for local mic/speaker testing).
+**Object detection not working?**
+- Ensure `./run_agent.sh` is running in a separate terminal. The agent processes camera frames; without it, frames are sent but never analyzed.
+- Enable obstacle mode on the app (double-tap the obstacle button), then point the camera at people or objects.
 
-2. **App**  
-   - Same `.env.local` as the agent; `./run_app.sh` passes LiveKit keys to the app. Obstacle uses OpenCV on the agent (no key).  
-   - Run: `./run_app.sh` (see [CONFIG.md](CONFIG.md)).
+**Voice not working?**
+- Check that both agent and app use the same `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET` in `.env.local`.
+- For local mic/speaker testing only (no phone): `uv run agent.py console` — but the phone app will not get agent responses.
 
-3. On the phone: enable **voice** (mic) and optionally **obstacle** (camera → haptics + voice). Ask “Where am I?” or “Navigate to [address]” / “Take me to the nearest coffee shop.”
+**App fails to connect?**
+- Use `./run_app.sh` (not plain `flutter run`) so keys from `.env.local` are passed to the app.
+- Confirm `.env.local` has valid LiveKit credentials.
 
-**Object detection not working?** Run `./run_agent.sh` in a **separate terminal**. The agent registers with LiveKit and processes camera frames when the phone connects. Without it, frames are sent but never analyzed.
+**Test obstacle detection without the app?**
+```bash
+uv run python test_obstacle_local.py
+```
+Uses your computer’s camera and OpenCV. No LiveKit or API keys required.
 
 ---
 
