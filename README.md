@@ -21,7 +21,7 @@
 
 - **Flutter** (for the app)
 - **Python 3.10+** with **uv** (`pip install uv` or see [uv docs](https://github.com/astral-sh/uv))
-- **Accounts:** [LiveKit Cloud](https://cloud.livekit.io/) (free tier), [Google AI](https://aistudio.google.com/) (Gemini), [ElevenLabs](https://elevenlabs.io/) (STT + TTS), [Google Maps](https://console.cloud.google.com/) (Directions + Places APIs)
+- **Accounts:** [LiveKit Cloud](https://cloud.livekit.io/) (free tier), [Google AI](https://aistudio.google.com/) (Gemini), [ElevenLabs](https://elevenlabs.io/) (STT + TTS), [Google Maps](https://console.cloud.google.com/) (Directions + Places APIs), [Backboard](https://backboard.io/) (optional, for conversation memory)
 
 ---
 
@@ -67,32 +67,76 @@
 ## Architecture
 
 ```
-┌─────────────────────┐     ┌─────────────────────┐     ┌─────────────────────┐
-│   Phone (Flutter)    │     │   LiveKit Cloud      │     │   Your computer      │
-│                     │     │                     │     │   (agent.py)          │
-│  Mic ───────────────┼────►│                     │◄───►│   STT → LLM → TTS     │
-│  GPS (topic: gps) ──┼────►│   Room               │     │   OpenCV obstacle     │
-│  Camera (obstacle-  │     │                     │     │   Google Maps tools   │
-│  frame) ───────────┼────►│                     │     │                       │
-│                     │◄────│                     │◄────│  obstacle results     │
-│  Speaker ◄──────────┼─────│                     │─────│  TTS audio            │
-└─────────────────────┘     └─────────────────────┘     └─────────────────────┘
+                                    ┌──────────────────────────────────────────────────────────────────┐
+                                    │                        LiveKit Cloud                              │
+                                    │  (Room: audio + data topics)                                     │
+                                    └─────────────────────┬────────────────────────────────────────────┘
+                                                          │
+         ┌───────────────────────────────────────────────┼───────────────────────────────────────────────┐
+         │                                               │                                               │
+         │  PHONE (Flutter)                               │                         AGENT (Python)       │
+         │  lib/main.dart · voice_service.dart · config   │                         agent.py              │
+         │                                               │                                               │
+         │  ┌─────────────┐    Mic audio                  │                         ┌─────────────────┐  │
+         │  │   Microphone │ ─────────────────────────────┼──────────────────────────►│  AgentSession   │  │
+         │  └─────────────┘                              │                         │  STT→LLM→TTS    │  │
+         │                                               │                         └────────┬────────┘  │
+         │  ┌─────────────┐    GPS (topic: gps)          │                                  │            │
+         │  │ Geolocator  │ ─────────────────────────────┼──────────────────────────►│ NavigationTool │  │
+         │  │ + Compass   │    lat, lng, heading         │                         │ google_maps.py │  │
+         │  └─────────────┘                              │                         │ navigation.py  │  │
+         │                                               │                         └────────┬────────┘  │
+         │  ┌─────────────┐    app-mode, obstacle-mode   │                                  │            │
+         │  │     UI      │ ─────────────────────────────┼──────────────────────────►│  on_data_received│ │
+         │  │  Navigation │    obstacle-frame (JPEG)     │                         └────────┬────────┘  │
+         │  │  Obstacle   │ ─────────────────────────────┼──────────────────────────►│ObstacleProcessor│  │
+         │  └─────────────┘                              │                         │  obstacle.py    │  │
+         │                                               │                         └────────┬────────┘  │
+         │  ┌─────────────┐    TTS audio                 │                                  │            │
+         │  │   Speaker   │ ◄─────────────────────────────┼──────────────────────────│  session.say()  │  │
+         │  └─────────────┘                              │                                  │            │
+         │  ┌─────────────┐    obstacle (topic)          │                                  │            │
+         │  │   Haptics   │ ◄─────────────────────────────┼──────────────────────────│_publish_obstacle│  │
+         │  │   + TTS     │    detected, description      │                                  │            │
+         │  └─────────────┘                              │                         ┌────────┴────────┐  │
+         │                                               │                         │ Backboard       │  │
+         │                                               │                         │ backboard_store │  │
+         │                                               │                         └─────────────────┘  │
+         └───────────────────────────────────────────────┼───────────────────────────────────────────────┘
+                                                         │
+                    ┌────────────────────────────────────┼────────────────────────────────────┐
+                    │                    EXTERNAL APIs (used by agent)                         │
+                    │                                                                          │
+                    │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
+                    │  │  ElevenLabs  │  │ Google AI    │  │ Google Maps  │  │  Backboard   │  │
+                    │  │  STT + TTS   │  │  (Gemini)    │  │  Directions  │  │  (memory)    │  │
+                    │  │  Voice synth │  │  LLM        │  │  Places API  │  │  Optional    │  │
+                    │  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘  │
+                    └─────────────────────────────────────────────────────────────────────────┘
 ```
 
 **Data flow:**
 
-| From | To | What |
-|------|----|------|
-| **Phone** | **LiveKit** | Microphone audio, GPS (topic `gps`), camera frames (topic `obstacle-frame`) |
-| **Agent** | **LiveKit** | Synthesized speech (TTS), obstacle results (topic `obstacle`) |
-| **LiveKit** | **Phone** | Agent’s voice, obstacle alerts (haptics + optional voice) |
-| **Agent** | **APIs** | ElevenLabs (STT + TTS), Gemini (LLM), Google Maps (navigation) |
+| From | To | Topic / channel | What |
+|------|----|----------------|------|
+| **Phone** | **LiveKit** | Audio | Microphone (real-time) |
+| **Phone** | **LiveKit** | `gps` | lat, lng, heading (every 3s when navigation on) |
+| **Phone** | **LiveKit** | `app-mode` | Navigation/obstacle toggle |
+| **Phone** | **LiveKit** | `obstacle-mode` | Obstacle detection on/off |
+| **Phone** | **LiveKit** | `obstacle-frame` | Base64 JPEG frames |
+| **Agent** | **LiveKit** | Audio | Synthesized speech (ElevenLabs TTS) |
+| **Agent** | **LiveKit** | `obstacle` | `{detected, description}` |
+| **LiveKit** | **Phone** | — | Agent audio, obstacle data → haptics + voice |
+| **Agent** | **ElevenLabs** | HTTP | STT (speech-to-text), TTS (text-to-speech) |
+| **Agent** | **Gemini** | HTTP | LLM reasoning and tool calls |
+| **Agent** | **Google Maps** | HTTP | Directions, Places, Geocoding |
+| **Agent** | **Backboard** | HTTP | Optional conversation memory |
 
 **Voice pipeline:** User speaks → ElevenLabs STT → Gemini LLM → ElevenLabs TTS → Speaker
 
-**Obstacle pipeline:** Camera frame → Agent (OpenCV) → Haptics + voice alert
+**Obstacle pipeline:** Camera → resize (isolate) → JPEG → LiveKit → ObstacleProcessor (HOG or YOLOv8n) → Agent publishes obstacle → Phone haptics + voice
 
-No token server — app generates LiveKit token in-app.
+**No token server** — app generates LiveKit JWT in-app (`voice_service.dart`).
 
 ---
 
