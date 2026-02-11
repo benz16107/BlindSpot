@@ -81,17 +81,17 @@ flowchart TB
     end
 
     subgraph Agent["🖥️ Agent (Python)"]
-        Session[AgentSession\nSTT → LLM → TTS]
-        Nav[NavigationTool\ngoogle_maps · navigation]
-        Obstacle[ObstacleProcessor\nobstacle.py]
-        Memory[Backboard\nbackboard_store]
+        Session[AgentSession<br/>STT → LLM → TTS]
+        Nav[NavigationTool<br/>google_maps · navigation]
+        Obstacle[ObstacleProcessor<br/>obstacle.py]
+        Memory[Backboard<br/>backboard_store]
     end
 
     subgraph APIs["🌐 External APIs"]
-        ElevenLabs[ElevenLabs\nSTT + TTS]
-        Gemini[Google AI\nGemini LLM]
-        Maps[Google Maps\nDirections + Places]
-        Backboard[Backboard\nmemory]
+        ElevenLabs[ElevenLabs<br/>STT + TTS]
+        Gemini[Google AI<br/>Gemini LLM]
+        Maps[Google Maps<br/>Directions + Places]
+        Backboard[Backboard<br/>memory]
     end
 
     Mic -->|audio| Room
