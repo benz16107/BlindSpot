@@ -56,8 +56,8 @@ const int obstacleImageMaxWidth = 256;
 /// JPEG quality 1–100. Lower = smaller payload for LiveKit.
 const int obstacleJpegQuality = 40;
 
-/// Haptic pulse interval while obstacle is detected (ms).
-const int obstacleHapticPeriodMs = 350;
+/// Haptic pulse interval while obstacle is detected (ms). Shorter = more intense.
+const int obstacleHapticPeriodMs = 200;
 
 /// If no update received for this long while in obstacle state, auto-clear (handles stuck model).
 const int obstacleStaleClearMs = 2500;

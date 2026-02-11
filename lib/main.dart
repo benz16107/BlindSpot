@@ -6,7 +6,7 @@ import 'dart:ui' as ui;
 
 import 'package:camera/camera.dart';
 import 'package:image/image.dart' as img;
-import 'package:flutter/foundation.dart' show kIsWeb, debugPrint, compute;
+import 'package:flutter/foundation.dart' show defaultTargetPlatform, kIsWeb, debugPrint, compute, TargetPlatform;
 import 'package:flutter/material.dart';
 import 'package:flutter/semantics.dart';
 import 'package:flutter/services.dart';
@@ -25,6 +25,66 @@ Uint8List? _resizeObstacleImageIsolate(Uint8List jpegBytes) {
   try {
     final decoded = img.decodeImage(jpegBytes);
     if (decoded == null) return null;
+    final w = decoded.width;
+    final h = decoded.height;
+    final cropW = (w * 0.8).round();
+    final cropH = (h * 0.8).round();
+    final x = (w - cropW) ~/ 2;
+    final y = (h - cropH) ~/ 2;
+    final cropped =
+        img.copyCrop(decoded, x: x, y: y, width: cropW, height: cropH);
+    final scale = obstacleImageMaxWidth / cropped.width;
+    final resized = img.copyResize(
+      cropped,
+      width: obstacleImageMaxWidth,
+      height: (cropped.height * scale).round(),
+    );
+    for (final q in [obstacleJpegQuality, 35, 25, 20, 15]) {
+      final encoded = img.encodeJpg(resized, quality: q);
+      final bytes = Uint8List.fromList(encoded);
+      if (bytes.length <= maxBytes) return bytes;
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/// Arguments for _processBgraFrameForObstacle (for compute isolate).
+class _ProcessBgraArgs {
+  const _ProcessBgraArgs(
+    this.planeBytes,
+    this.width,
+    this.height,
+    this.bytesPerRow,
+    this.bytesOffset,
+  );
+  final Uint8List planeBytes;
+  final int width;
+  final int height;
+  final int bytesPerRow;
+  final int bytesOffset;
+}
+
+/// Converts BGRA8888 CameraImage to resized JPEG bytes (no shutter sound).
+/// Used when obstacle detection is on - avoids takePicture() which triggers iOS shutter sound.
+Uint8List? _processBgraFrameForObstacle(_ProcessBgraArgs args) {
+  final planeBytes = args.planeBytes;
+  final width = args.width;
+  final height = args.height;
+  final bytesPerRow = args.bytesPerRow;
+  final bytesOffset = args.bytesOffset;
+  const maxBytes = 10000;
+  try {
+    final decoded = img.Image.fromBytes(
+      width: width,
+      height: height,
+      bytes: planeBytes.buffer,
+      bytesOffset: bytesOffset,
+      rowStride: bytesPerRow,
+      order: img.ChannelOrder.bgra,
+      numChannels: 4,
+    );
     final w = decoded.width;
     final h = decoded.height;
     final cropW = (w * 0.8).round();
@@ -276,6 +336,10 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
   bool _obstacleCheckInProgress = false;
   bool _obstacleInFront = false;
   String _obstacleDescription = '';
+  CameraImage? _latestObstacleFrame;
+  bool _cameraFormatIsBgra = false; // true when using bgra8888 (silent capture)
+  Timer? _obstacleBorderFlashTimer;
+  bool _obstacleBorderFlashOn = false;
 
   @override
   void initState() {
@@ -340,11 +404,13 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
       orElse: () => widget.cameras.first,
     );
 
-    final controller = CameraController(
+    // Use bgra8888 to allow startImageStream for obstacle detection without shutter sound (iOS).
+    // Fall back to jpeg if bgra8888 is not supported on the device.
+    CameraController controller = CameraController(
       camera,
       ResolutionPreset.medium,
       enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.jpeg,
+      imageFormatGroup: ImageFormatGroup.bgra8888,
     );
 
     try {
@@ -353,15 +419,37 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
         _controller = controller;
         _initializing = false;
         _status = "Camera ready. Getting GPS…";
+        _cameraFormatIsBgra = true;
       });
 
       // Start location after camera is ready (so UI feels responsive)
       await _startLocation();
-    } on CameraException catch (e) {
-      setState(() {
-        _status = "Camera error: ${e.code} ${e.description}";
-        _initializing = false;
-      });
+    } on CameraException catch (_) {
+      await controller.dispose();
+      controller = CameraController(
+        camera,
+        ResolutionPreset.medium,
+        enableAudio: false,
+        imageFormatGroup: ImageFormatGroup.jpeg,
+      );
+      try {
+        await controller.initialize();
+        if (mounted) {
+          setState(() {
+            _controller = controller;
+            _initializing = false;
+            _status = "Camera ready. Getting GPS…";
+          });
+          await _startLocation();
+        }
+      } on CameraException catch (e2) {
+        if (mounted) {
+          setState(() {
+            _status = "Camera error: ${e2.code} ${e2.description}";
+            _initializing = false;
+          });
+        }
+      }
     }
   }
 
@@ -468,11 +556,20 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
     if (!mounted) return;
     debugPrint('Obstacle: detected=$detected desc="$description"');
     _obstacleStaleTimer?.cancel();
+    _obstacleBorderFlashTimer?.cancel();
     setState(() {
       _obstacleInFront = detected;
       _obstacleDescription = description;
+      _obstacleBorderFlashOn = false;
     });
     if (detected) {
+      _obstacleBorderFlashTimer = Timer.periodic(
+        const Duration(milliseconds: 400),
+        (_) {
+          if (!mounted || !_obstacleInFront) return;
+          setState(() => _obstacleBorderFlashOn = !_obstacleBorderFlashOn);
+        },
+      );
       _startObstacleHaptics();
       _obstacleStaleTimer = Timer(
         const Duration(milliseconds: obstacleStaleClearMs),
@@ -480,14 +577,19 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
           if (!mounted || !_obstacleDetectionOn) return;
           _obstacleStaleTimer?.cancel();
           _obstacleStaleTimer = null;
+          _obstacleBorderFlashTimer?.cancel();
+          _obstacleBorderFlashTimer = null;
           setState(() {
             _obstacleInFront = false;
             _obstacleDescription = '';
+            _obstacleBorderFlashOn = false;
           });
           _stopObstacleHaptics();
         },
       );
     } else {
+      _obstacleBorderFlashTimer?.cancel();
+      _obstacleBorderFlashTimer = null;
       _stopObstacleHaptics();
     }
   }
@@ -523,6 +625,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
     _stopObstacleHaptics();
     _voiceService.publishObstacleMode(true, navigation: _navigationOn);
     _voiceService.publishAppMode(navigation: _navigationOn, obstacles: true);
+    await _startObstacleImageStream();
     _obstacleTimer?.cancel();
     _obstacleTimer = Timer.periodic(
       const Duration(milliseconds: obstacleCheckIntervalMs),
@@ -535,6 +638,10 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
     if (!_obstacleDetectionOn) return;
     _obstacleDetectionOn = false;
     _obstacleInFront = false;
+    _obstacleBorderFlashTimer?.cancel();
+    _obstacleBorderFlashTimer = null;
+    _obstacleBorderFlashOn = false;
+    unawaited(_stopObstacleImageStream());
     _obstacleDescription = '';
     _obstacleTimer?.cancel();
     _obstacleTimer = null;
@@ -553,13 +660,40 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
     _obstacleHapticTimer?.cancel();
     _obstacleHapticTimer = Timer.periodic(
       const Duration(milliseconds: obstacleHapticPeriodMs),
-      (_) => HapticFeedback.heavyImpact(),
+      (_) {
+        HapticFeedback.heavyImpact();
+        Future.delayed(
+          const Duration(milliseconds: 50),
+          () => HapticFeedback.heavyImpact(),
+        );
+      },
     );
   }
 
   void _stopObstacleHaptics() {
     _obstacleHapticTimer?.cancel();
     _obstacleHapticTimer = null;
+  }
+
+  Future<void> _startObstacleImageStream() async {
+    final ctrl = _controller;
+    if (ctrl == null || !ctrl.value.isInitialized || !_cameraFormatIsBgra) return;
+    try {
+      _latestObstacleFrame = null;
+      await ctrl.startImageStream((CameraImage image) {
+        _latestObstacleFrame = image;
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _stopObstacleImageStream() async {
+    final ctrl = _controller;
+    if (ctrl != null && ctrl.value.isInitialized) {
+      try {
+        await ctrl.stopImageStream();
+      } catch (_) {}
+    }
+    _latestObstacleFrame = null;
   }
 
   Future<void> _runObstacleCheck() async {
@@ -572,12 +706,36 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
     if (_obstacleCheckInProgress) return;
     _obstacleCheckInProgress = true;
     try {
-      final XFile file = await controller.takePicture();
-      final bytes = await file.readAsBytes();
-      final resized = await compute(_resizeObstacleImageIsolate, bytes);
-      if (resized == null || resized.isEmpty) return;
-      final base64 = base64Encode(resized);
-      _voiceService.publishObstacleFrame(base64);
+      Uint8List? resized;
+      if (_cameraFormatIsBgra && _latestObstacleFrame != null) {
+        // Use image stream (no shutter sound on iOS)
+        final frame = _latestObstacleFrame!;
+        if (frame.planes.isNotEmpty) {
+          final plane = frame.planes[0];
+          final bytesOffset =
+              defaultTargetPlatform == TargetPlatform.iOS ? 28 : 0;
+          resized = await compute(
+            _processBgraFrameForObstacle,
+            _ProcessBgraArgs(
+              plane.bytes,
+              frame.width,
+              frame.height,
+              plane.bytesPerRow,
+              bytesOffset,
+            ),
+          );
+        }
+      }
+      if (resized == null || resized.isEmpty) {
+        // Fallback to takePicture (plays shutter sound on iOS)
+        final XFile file = await controller.takePicture();
+        final bytes = await file.readAsBytes();
+        resized = await compute(_resizeObstacleImageIsolate, bytes);
+      }
+      if (resized != null && resized.isNotEmpty) {
+        final base64 = base64Encode(resized);
+        _voiceService.publishObstacleFrame(base64);
+      }
     } catch (_) {
     } finally {
       if (mounted) _obstacleCheckInProgress = false;
@@ -819,7 +977,13 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                         color: Colors.black.withOpacity(0.68),
                         borderRadius: BorderRadius.circular(20),
                         border: Border.all(
-                            color: Colors.white.withOpacity(0.4), width: 1),
+                          color: _obstacleInFront
+                              ? (_obstacleBorderFlashOn
+                                  ? Colors.orange
+                                  : Colors.orange.withOpacity(0.5))
+                              : Colors.white.withOpacity(0.4),
+                          width: _obstacleInFront ? 2 : 1,
+                        ),
                       ),
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
@@ -891,7 +1055,9 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                     ? 'Obstacle: $_obstacleDescription'
                                     : 'Object detection: scanning',
                                 style: TextStyle(
-                                  color: Colors.white.withOpacity(0.9),
+                                  color: _obstacleInFront
+                                      ? Colors.orange
+                                      : Colors.white.withOpacity(0.9),
                                   fontSize: 14,
                                   fontWeight: FontWeight.w500,
                                 ),
@@ -1140,7 +1306,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                     borderRadius: BorderRadius.circular(26),
                                     child: Container(
                                       padding: const EdgeInsets.symmetric(
-                                          vertical: 48, horizontal: 16),
+                                          vertical: 32, horizontal: 12),
                                       alignment: Alignment.center,
                                       child: _voiceConnecting &&
                                               !_voiceService.isConnected
@@ -1159,20 +1325,20 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                               children: [
                                                 Icon(
                                                   Icons.navigation_rounded,
-                                                  size: 36,
+                                                  size: 26,
                                                   color: _navigationOn
                                                       ? Colors.white
                                                       : Colors.white
                                                           .withOpacity(0.9),
                                                 ),
-                                                const SizedBox(width: 10),
+                                                const SizedBox(width: 8),
                                                 Flexible(
                                                   child: Text(
                                                     'Navigation',
                                                     overflow:
                                                         TextOverflow.ellipsis,
                                                     style: TextStyle(
-                                                      fontSize: 22,
+                                                      fontSize: 16,
                                                       fontWeight:
                                                           FontWeight.w600,
                                                       color: _navigationOn
@@ -1209,7 +1375,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                       borderRadius: BorderRadius.circular(26),
                                       child: Container(
                                         padding: const EdgeInsets.symmetric(
-                                            vertical: 48, horizontal: 16),
+                                            vertical: 32, horizontal: 12),
                                         alignment: Alignment.center,
                                         child: Row(
                                           mainAxisAlignment:
@@ -1218,19 +1384,19 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                           children: [
                                             Icon(
                                               Icons.warning_amber_rounded,
-                                              size: 36,
+                                              size: 26,
                                               color: _obstacleDetectionOn
                                                   ? Colors.white
                                                   : Colors.white
                                                       .withOpacity(0.9),
                                             ),
-                                            const SizedBox(width: 10),
+                                            const SizedBox(width: 8),
                                             Flexible(
                                               child: Text(
                                                 'Obstacles',
                                                 overflow: TextOverflow.ellipsis,
                                                 style: TextStyle(
-                                                  fontSize: 22,
+                                                  fontSize: 16,
                                                   fontWeight: FontWeight.w600,
                                                   color: _obstacleDetectionOn
                                                       ? Colors.white

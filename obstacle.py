@@ -98,7 +98,7 @@ def _hog_detect_person(img: np.ndarray) -> Optional[tuple]:
     return None
 
 
-def _yolo_detect(net: cv2.dnn.Net, img: np.ndarray, conf_thresh: float = 0.2) -> Optional[tuple]:
+def _yolo_detect(net: cv2.dnn.Net, img: np.ndarray, conf_thresh: float = 0.35) -> Optional[tuple]:
     """Returns (class_name, ) for first obstacle in center region else None."""
     h, w = img.shape[:2]
     length = max(h, w)

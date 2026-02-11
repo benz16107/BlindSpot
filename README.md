@@ -12,6 +12,7 @@
 |----------|---------|---------|
 | **1** | `./run_agent.sh` | Voice agent + obstacle detection (connects to LiveKit) |
 | **2** | `./run_app.sh` | Flutter app (phone or simulator) |
+| **2** | `./run_app_release.sh` | Install release build (app works after you close it; no USB needed) |
 
 **Before first run:** Copy `.env.local.template` → `.env.local` and add your API keys. See [CONFIG.md](CONFIG.md) for details.
 
@@ -165,6 +166,13 @@ flowchart TB
 **App fails to connect?**
 - Use `./run_app.sh` (not plain `flutter run`) so keys from `.env.local` are passed to the app.
 - Confirm `.env.local` has valid LiveKit credentials.
+
+**App won't reopen after you close it?**
+- Use `./run_app_release.sh` instead of `./run_app.sh` to install a release build. The app will then work after you close it and reopen from the home screen (no USB needed).
+
+**iOS Simulator not launching?**
+- If `flutter emulators --launch apple_ios_simulator` does nothing, run `./run_simulator.sh` instead. It boots a device and opens the Simulator app.
+- Or manually: `open -a Simulator`, then run `./run_app.sh` and choose the simulator when prompted.
 
 **Test obstacle detection without the app?**
 ```bash
