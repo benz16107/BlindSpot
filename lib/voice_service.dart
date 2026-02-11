@@ -8,7 +8,8 @@ import 'package:livekit_client/livekit_client.dart';
 
 import 'config.dart';
 
-/// Toggle voice agent on/off. When on: connects to LiveKit, publishes mic + GPS.
+/// Connects to LiveKit for voice agent, obstacle detection, or both.
+/// GPS is published only when navigation mode is enabled.
 /// When off: disconnects; memory is kept on the server (Backboard) and restored on next connect.
 class VoiceService extends ChangeNotifier {
   Room? _room;
@@ -19,8 +20,14 @@ class VoiceService extends ChangeNotifier {
   EventsListener<RoomEvent>? _roomListener;
 
   static const String _gpsTopic = 'gps';
-  static const String _obstacleTopic = 'obstacle';
+  static const String _appModeTopic = 'app-mode';
+  static const String _obstacleModeTopic = 'obstacle-mode';
+  static const String _obstacleFrameTopic = 'obstacle-frame';
+  static const String _obstacleDataTopic = 'obstacle';
   static const Duration _gpsInterval = Duration(seconds: 3);
+
+  /// Called when agent reports obstacle detected or cleared.
+  void Function(bool detected, String description)? onObstacleFromAgent;
 
   bool get isConnected => _room != null;
 
@@ -36,6 +43,32 @@ class VoiceService extends ChangeNotifier {
   }
 
   bool _disconnecting = false;
+  bool _navigationEnabled = false; // Publish GPS only when true
+
+  /// Enable/disable GPS publishing (for navigation). Call when navigation mode toggles.
+  void setNavigationEnabled(bool enabled) {
+    if (_navigationEnabled == enabled) return;
+    _navigationEnabled = enabled;
+    if (enabled) {
+      _startGpsPublishing();
+    } else {
+      _gpsTimer?.cancel();
+      _gpsTimer = null;
+    }
+  }
+
+  /// Fire-and-forget data publish with error handling. Avoids TimeoutException crashing the app.
+  void _publishDataSafe(List<int> data, String topic) {
+    final room = _room;
+    if (room == null) return;
+    final lp = room.localParticipant;
+    if (lp == null) return;
+    unawaited(
+      lp.publishData(data, topic: topic).catchError((e, st) {
+        debugPrint('VoiceService: publishData failed topic=$topic: $e');
+      }),
+    );
+  }
 
   /// Generate a LiveKit JWT in-app (no token server). Includes roomConfig so LiveKit dispatches voice-agent when we join.
   String _makeLiveKitToken(String identity, String roomName) {
@@ -85,11 +118,13 @@ class VoiceService extends ChangeNotifier {
       url = liveKitUrl.trim();
       if (url.startsWith('http://')) url = 'ws${url.substring(4)}';
       if (url.startsWith('https://')) url = 'wss${url.substring(5)}';
-      debugPrint('VoiceService: connecting to $url room=$roomName (in-app token). Ensure agent.py uses same LIVEKIT_URL.');
+      debugPrint(
+          'VoiceService: connecting to $url room=$roomName (in-app token). Ensure agent.py uses same LIVEKIT_URL.');
     } else {
       final tokenServerUrl = (tokenUrlOverride ?? tokenUrl).trim();
       if (tokenServerUrl.isEmpty) {
-        throw Exception('Token server URL not set. Set it in the app (e.g. http://YOUR_COMPUTER_IP:8765/token).');
+        throw Exception(
+            'LiveKit keys not set. Add LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET to .env.local and run with ./run_app.sh (in-app token, no server). Or set TOKEN_URL to your token server (e.g. http://YOUR_COMPUTER_IP:8765/token).');
       }
       final now = DateTime.now().millisecondsSinceEpoch;
       final identity = 'mobile-user-$now';
@@ -97,19 +132,28 @@ class VoiceService extends ChangeNotifier {
       final uri = Uri.parse(tokenServerUrl).replace(
         queryParameters: {'identity': identity, 'room': roomName},
       );
-      final resp = await http.get(uri);
-      if (resp.statusCode != 200) {
-        throw Exception('Token failed: ${resp.statusCode} ${resp.body}');
+      try {
+        final resp = await http.get(uri);
+        if (resp.statusCode != 200) {
+          throw Exception('Token failed: ${resp.statusCode} ${resp.body}');
+        }
+        final body = jsonDecode(resp.body) as Map<String, dynamic>;
+        final t = body['token'] as String?;
+        final u = body['url'] as String?;
+        if (t == null || t.isEmpty || u == null || u.isEmpty) {
+          throw Exception('Invalid token response: missing token or url');
+        }
+        token = t;
+        url = u;
+        debugPrint(
+            'VoiceService: connecting to token server room (url from server).');
+      } catch (e) {
+        if (uri.host == 'localhost' || uri.host == '127.0.0.1') {
+          throw Exception(
+              'Connection refused to $tokenServerUrl. On a device, localhost is the device itself. Use in-app token instead: add LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET to .env.local and run with ./run_app.sh.');
+        }
+        rethrow;
       }
-      final body = jsonDecode(resp.body) as Map<String, dynamic>;
-      final t = body['token'] as String?;
-      final u = body['url'] as String?;
-      if (t == null || t.isEmpty || u == null || u.isEmpty) {
-        throw Exception('Invalid token response: missing token or url');
-      }
-      token = t;
-      url = u;
-      debugPrint('VoiceService: connecting to token server room (url from server).');
     }
 
     try {
@@ -126,7 +170,7 @@ class VoiceService extends ChangeNotifier {
 
       _room = room;
       _audioPlaybackFailed = false;
-      _startGpsPublishing();
+      if (_navigationEnabled) _startGpsPublishing(); // Caller sets via setNavigationEnabled(true) for nav mode
 
       try {
         await room.startAudio();
@@ -174,7 +218,57 @@ class VoiceService extends ChangeNotifier {
           _audioPlaybackFailed = true;
           notifyListeners();
         }
+      })
+      ..on<DataReceivedEvent>((event) {
+        if (event.topic != _obstacleDataTopic) return;
+        try {
+          final json =
+              jsonDecode(utf8.decode(event.data)) as Map<String, dynamic>;
+          final detected = json['detected'] as bool? ?? false;
+          final desc = (json['description'] as String? ?? '').toString();
+          debugPrint('VoiceService: obstacle from agent: detected=$detected desc="$desc"');
+          onObstacleFromAgent?.call(detected, desc);
+        } catch (e) {
+          debugPrint('VoiceService: obstacle parse error: $e');
+        }
       });
+  }
+
+  /// Publish app mode so agent can pick the right greeting (nav vs obstacles-only).
+  void publishAppMode({required bool navigation, required bool obstacles}) {
+    final room = _room;
+    if (room == null) return;
+    final payload = utf8.encode('{"navigation":$navigation,"obstacles":$obstacles}');
+    _publishDataSafe(payload, _appModeTopic);
+  }
+
+  /// Publish obstacle mode (enable/disable) to agent.
+  /// Include [navigation] so agent knows if this is obstacles-only vs nav+obstacles.
+  void publishObstacleMode(bool enabled, {required bool navigation}) {
+    final room = _room;
+    if (room == null) return;
+    final payload = utf8.encode('{"enabled":$enabled,"navigation":$navigation}');
+    _publishDataSafe(payload, _obstacleModeTopic);
+    debugPrint('VoiceService: published obstacle-mode enabled=$enabled navigation=$navigation');
+  }
+
+  static int _obstacleFramesSent = 0;
+
+  /// Publish a single camera frame (base64 JPEG) to agent.
+  /// Payload must stay under 14KB for LiveKit reliable data (hard limit ~15KB).
+  void publishObstacleFrame(String base64Jpeg) {
+    final room = _room;
+    if (room == null) return;
+    final payload = utf8.encode('{"frame":"$base64Jpeg"}');
+    if (payload.length > 14 * 1024) {
+      debugPrint('VoiceService: obstacle frame too large (${payload.length} bytes > 14KB), skipping');
+      return;
+    }
+    _publishDataSafe(payload, _obstacleFrameTopic);
+    _obstacleFramesSent++;
+    if (_obstacleFramesSent <= 2 || _obstacleFramesSent % 25 == 0) {
+      debugPrint('VoiceService: obstacle frame sent #$_obstacleFramesSent (${payload.length} bytes)');
+    }
   }
 
   void _startGpsPublishing() {
@@ -197,28 +291,23 @@ class VoiceService extends ChangeNotifier {
   }
 
   void _publishGps() {
+    if (!_navigationEnabled) return;
     final room = _room;
     if (room == null) return;
     if (_lat == null || _lng == null) return;
 
-    try {
-      String payloadStr = '{"lat":$_lat,"lng":$_lng}';
-      if (_heading != null) payloadStr = '{"lat":$_lat,"lng":$_lng,"heading":$_heading}';
-      room.localParticipant?.publishData(utf8.encode(payloadStr), topic: _gpsTopic);
-    } catch (e) {
-      debugPrint('VoiceService GPS publish: $e');
+    String payloadStr = '{"lat":$_lat,"lng":$_lng}';
+    if (_heading != null) {
+      payloadStr = '{"lat":$_lat,"lng":$_lng,"heading":$_heading}';
     }
+    _publishDataSafe(utf8.encode(payloadStr), _gpsTopic);
   }
 
-  /// Notify the voice agent that obstacle detection found something (agent can warn user by voice).
-  void publishObstacleDetected(String description) {
-    final room = _room;
-    if (room == null) return;
-    try {
-      final payload = jsonEncode({'obstacle': description, 'ts': DateTime.now().millisecondsSinceEpoch});
-      room.localParticipant?.publishData(utf8.encode(payload), topic: _obstacleTopic);
-    } catch (e) {
-      debugPrint('VoiceService obstacle publish: $e');
+  /// Publish current GPS + heading immediately (e.g. when compass updates).
+  /// Ensures nav gets fresh heading when user turns. No-op if navigation disabled.
+  void publishGpsNow() {
+    if (_navigationEnabled && _room != null && _lat != null && _lng != null) {
+      _publishGps();
     }
   }
 

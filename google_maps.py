@@ -252,17 +252,18 @@ class NavigationTool:
             return f"Error starting navigation: {err_msg}"
 
     @llm.function_tool(description="Update user location (latitude, longitude) for navigation tracking. Call when you receive the user's current GPS coordinates to get the next turn instruction. Uses phone compass heading when available to announce 'head forward/left/right/behind' and cardinal direction (north, south, east, west).")
-    async def update_location(self, lat: float, lng: float) -> str:
+    async def update_location(self, lat: float, lng: float, heading: Optional[float] = None) -> str:
         """
         Updates the user's location. Returns an instruction only when approaching a turn
         (within ~45m warning or ~12m "Now"); otherwise returns empty string so the agent
         does not announce anything (no repeated "continue on route").
-        Uses phone compass (_latest_heading) to say "Head left, that's west" etc.
+        heading: compass 0-360 from the same GPS packet (ensures fresh direction when user turns).
         """
         if not self.session.active_route:
             return "Navigation not active."
 
-        instruction = self.session.update_location(lat, lng, self._latest_heading)
+        h = heading if heading is not None else self._latest_heading
+        instruction = self.session.update_location(lat, lng, h)
         if instruction:
             return instruction
         # No turn to announce – return empty so the agent does not speak

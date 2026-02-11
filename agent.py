@@ -1,7 +1,9 @@
 import asyncio
-import os
+import json
 import logging
+import os
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -21,12 +23,16 @@ from livekit.plugins import (
 )
 from google.genai import types
 
-from mcp_client import MCPServerHttp, MCPToolsIntegration
 from backboard_store import init_backboard
 from google_maps import NavigationTool, GPS_DATA_TOPIC
+from obstacle import ObstacleProcessor
 
 import agent_config as cfg
 
+# LiveKit data topics for obstacle detection (must match Flutter)
+APP_MODE_TOPIC = "app-mode"
+OBSTACLE_MODE_TOPIC = "obstacle-mode"
+OBSTACLE_FRAME_TOPIC = "obstacle-frame"
 OBSTACLE_DATA_TOPIC = "obstacle"
 
 # Configure logging
@@ -35,7 +41,7 @@ logger = logging.getLogger("agent")
 
 class Assistant(Agent):
     def __init__(self, instructions: str = None) -> None:
-        default_instructions = instructions or "You are a helpful voice AI assistant. You can use the tools provided to you to help the user (Zapier MCP Server)"
+        default_instructions = instructions or "You are a helpful voice AI assistant."
         super().__init__(instructions=default_instructions)
 
 server = AgentServer()
@@ -44,30 +50,16 @@ server = AgentServer()
 async def my_agent(ctx: agents.JobContext):
     room_name = getattr(ctx.room, "name", None) or "unknown"
     logger.info("Agent job started for room=%s", room_name)
+    # Obstacle detection uses OpenCV (no API key required)
 
-    # 1. Run Backboard init and MCP connect in parallel to reduce activation time
-    mcp_server = MCPServerHttp(
-        params={
-            "url": os.environ.get("ZAPIER_MCP_URL"),
-            "headers": {
-                "Authorization": f"Bearer {os.environ.get('ZAPIER_MCP_TOKEN')}"
-            }
-        },
-        cache_tools_list=True,
-        name="Zapier MCP Server"
-    )
-    backboard_task = asyncio.create_task(init_backboard())
-    mcp_connect_task = asyncio.create_task(mcp_server.connect())
+    # 1. Initialize Backboard (optional memory)
     try:
-        memory_manager = await backboard_task
-        logger.info(f"✓ Backboard initialized: thread_id={memory_manager.thread_id}")
+        memory_manager = await init_backboard()
+        if memory_manager:
+            logger.info(f"✓ Backboard initialized: thread_id={memory_manager.thread_id}")
     except Exception as e:
         logger.error(f"Failed to initialize Backboard: {e}")
         memory_manager = None
-    try:
-        await mcp_connect_task
-    except Exception as e:
-        logger.warning("MCP connect (parallel) failed: %s", e)
 
     # 2. Load thread history (from agent_config)
     context_text = ""
@@ -121,19 +113,9 @@ async def my_agent(ctx: agents.JobContext):
 
         session.on("conversation_item_added", on_conversation_item_added)
 
-    try:
-        agent = await MCPToolsIntegration.create_agent_with_tools(
-            agent_class=Assistant,
-            mcp_servers=[mcp_server],
-            agent_kwargs={"instructions": full_instructions},
-            memory_manager=memory_manager
-        )
-        logger.info("Agent created with MCP (Zapier) tools")
-    except Exception as e:
-        logger.warning("MCP failed, using navigation-only agent: %s", e)
-        agent = Assistant(instructions=full_instructions)
-        if not getattr(agent, "_tools", None) or not isinstance(agent._tools, list):
-            agent._tools = []
+    agent = Assistant(instructions=full_instructions)
+    if not getattr(agent, "_tools", None) or not isinstance(agent._tools, list):
+        agent._tools = []
 
     # Register Google Maps navigation tools
     nav_tool = NavigationTool()
@@ -155,61 +137,150 @@ async def my_agent(ctx: agents.JobContext):
 
     # Use constantly updating GPS from the phone. Client should publish JSON { "lat": <float>, "lng": <float> } with topic "gps".
     room = ctx.room
-    import json as _json
+
+    # App mode: navigation on/off, obstacles on/off (for greeting)
+    # Default to False — if no mode data arrives we must NOT say the nav greeting
+    app_navigation_enabled = False
+    app_obstacles_enabled = False
+    greeting_said = False
+
+    # Obstacle processor: receives frames from app, runs OpenCV detection
+    obstacle_processor: Optional[ObstacleProcessor] = None
+    obstacle_frames_received = 0
+
+    async def _publish_obstacle(detected: bool, description: str = "") -> None:
+        try:
+            payload = json.dumps({"detected": detected, "description": description})
+            await room.local_participant.publish_data(
+                payload.encode("utf-8"),
+                topic=OBSTACLE_DATA_TOPIC,
+                reliable=True,
+            )
+            logger.debug("obstacle published: detected=%s desc=%r", detected, description)
+        except Exception as e:
+            logger.warning("obstacle publish failed: %s", e)
+
+    async def _on_obstacle_detected(description: str, is_new: bool) -> None:
+        await _publish_obstacle(True, description)
+        # During nav grace period (summary + first direction), don't speak obstacle; haptics only.
+        if is_new and not nav_tool.session.is_in_initial_nav_phase():
+            try:
+                phrase = cfg.OBSTACLE_PHRASE_TEMPLATE.format(description=description)
+                session.interrupt()
+                await session.say(phrase)
+            except Exception as e:
+                logger.debug("obstacle say: %s", e)
+
+    async def _on_obstacle_clear() -> None:
+        await _publish_obstacle(False, "")
+
+    def _start_obstacle_processor() -> None:
+        nonlocal obstacle_processor
+        if obstacle_processor:
+            return
+        obstacle_processor = ObstacleProcessor(
+            on_obstacle=_on_obstacle_detected,
+            on_clear=_on_obstacle_clear,
+        )
+        obstacle_processor.start()
+        logger.info("Obstacle processor started")
+
+    def _stop_obstacle_processor() -> None:
+        nonlocal obstacle_processor
+        if obstacle_processor:
+            obstacle_processor.stop()
+            obstacle_processor = None
+            logger.info("Obstacle processor stopped")
 
     def _on_data_received(packet):
+        nonlocal app_navigation_enabled, app_obstacles_enabled
         topic = getattr(packet, "topic", None) or ""
-
-        # Obstacle: single voice — agent announces when app sends (only when obstacle button is on)
-        if topic == OBSTACLE_DATA_TOPIC:
+        if topic == GPS_DATA_TOPIC:
             try:
-                payload = _json.loads(packet.data.decode("utf-8"))
-                desc = payload.get("obstacle") or "object"
-                phrase = cfg.OBSTACLE_PHRASE_TEMPLATE.format(description=desc)
-                session.interrupt()
-                session.say(phrase)
-            except Exception as e:
-                logger.debug("Obstacle data_received: %s", e)
-            return
-
-        if topic != GPS_DATA_TOPIC:
-            return
-        try:
-            payload = _json.loads(packet.data.decode("utf-8"))
-            lat = payload.get("lat")
-            lng = payload.get("lng")
-            if lat is None or lng is None:
-                return
-            lat, lng = float(lat), float(lng)
-            heading = payload.get("heading")
-            if heading is not None:
-                try:
-                    heading = float(heading)
-                except (TypeError, ValueError):
-                    heading = None
-            nav_tool.set_latest_gps(lat, lng, heading)
-            if nav_tool.session.active_route:
-                async def _process_gps():
+                payload = json.loads(packet.data.decode("utf-8"))
+                lat = payload.get("lat")
+                lng = payload.get("lng")
+                if lat is None or lng is None:
+                    return
+                lat, lng = float(lat), float(lng)
+                heading = payload.get("heading")
+                if heading is not None:
                     try:
-                        instruction = await nav_tool.update_location(lat, lng)
-                        if instruction and session:
-                            # Interrupt any current speech so the nav instruction is heard immediately (like a nav app)
-                            session.interrupt()
-                            session.say(instruction)
-                    except Exception as e:
-                        logger.debug(f"GPS update_location/say: {e}")
-                try:
-                    asyncio.get_running_loop().create_task(_process_gps())
-                except RuntimeError:
-                    pass
-        except Exception as e:
-            logger.debug(f"GPS data_received parse: {e}")
+                        heading = float(heading)
+                    except (TypeError, ValueError):
+                        heading = None
+                nav_tool.set_latest_gps(lat, lng, heading)
+                if nav_tool.session.active_route:
+                    packet_heading = heading
+                    async def _process_gps():
+                        try:
+                            instruction = await nav_tool.update_location(lat, lng, packet_heading)
+                            if instruction and session:
+                                session.interrupt()
+                                session.say(instruction)
+                        except Exception as e:
+                            logger.debug(f"GPS update_location/say: {e}")
+                    try:
+                        asyncio.get_running_loop().create_task(_process_gps())
+                    except RuntimeError:
+                        pass
+            except Exception as e:
+                logger.debug(f"GPS data_received parse: {e}")
+        elif topic == APP_MODE_TOPIC:
+            try:
+                data = packet.data.decode("utf-8")
+                payload = json.loads(data)
+                app_navigation_enabled = payload.get("navigation", True)
+                app_obstacles_enabled = payload.get("obstacles", False)
+                logger.info("app-mode received: navigation=%s obstacles=%s", app_navigation_enabled, app_obstacles_enabled)
+            except Exception as e:
+                logger.debug("app-mode parse error: %s", e)
+        elif topic == OBSTACLE_MODE_TOPIC:
+            try:
+                data = packet.data.decode("utf-8")
+                payload = json.loads(data)
+                enabled = payload.get("enabled", False)
+                nav_enabled = payload.get("navigation", app_navigation_enabled)
+                app_obstacles_enabled = enabled
+                app_navigation_enabled = nav_enabled
+                logger.info("obstacle-mode received: enabled=%s navigation=%s", enabled, nav_enabled)
+                if enabled:
+                    _start_obstacle_processor()
+                else:
+                    _stop_obstacle_processor()
+            except Exception as e:
+                logger.warning("obstacle-mode parse error: %s", e)
+        elif topic == OBSTACLE_FRAME_TOPIC:
+            nonlocal obstacle_frames_received
+            try:
+                data = packet.data.decode("utf-8")
+                if data.strip().startswith("{"):
+                    obj = json.loads(data)
+                    b64 = (obj.get("frame") or "").strip()
+                else:
+                    b64 = data.strip()
+                if not b64:
+                    return
+                obstacle_frames_received += 1
+                if obstacle_frames_received <= 3 or obstacle_frames_received % 20 == 0:
+                    logger.info("obstacle-frame received (total=%d, payload_len=%d)", obstacle_frames_received, len(data))
+                # Start processor on first frame if app requested obstacles, OR whenever we get frames
+                # (handles race: obstacle-mode may have been sent before agent joined)
+                if not obstacle_processor:
+                    app_obstacles_enabled = True
+                    _start_obstacle_processor()
+                    logger.info("obstacle processor started from first frame (obstacle-mode may have arrived before agent)")
+                if obstacle_processor:
+                    obstacle_processor.put_frame(b64)
+            except Exception as e:
+                logger.warning("obstacle-frame parse error: %s", e)
 
     room.on("data_received", _on_data_received)
-    logger.info("Subscribed to room data (topic=%s, %s)", GPS_DATA_TOPIC, OBSTACLE_DATA_TOPIC)
+    logger.info("Subscribed to room data (topics: gps, app-mode, obstacle-mode, obstacle-frame)")
 
     def _on_participant_disconnected(participant):
         """When the phone disconnects, leave the room so next connect gets a fresh agent."""
+        _stop_obstacle_processor()
         logger.info("Participant %s left; agent leaving room so next connect gets a new session", participant.identity)
 
         async def _leave():
@@ -226,9 +297,22 @@ async def my_agent(ctx: agents.JobContext):
     room.on("participant_disconnected", _on_participant_disconnected)
 
     async def say_greeting():
-        await asyncio.sleep(cfg.GREETING_DELAY_SECONDS)
+        nonlocal greeting_said
+        # Wait long enough for Flutter to send (and retry) app-mode / obstacle-mode
+        await asyncio.sleep(4.0)
+        if greeting_said:
+            return
+        greeting_said = True
         try:
-            await session.say(cfg.GREETING_PHRASE)
+            if app_obstacles_enabled and not app_navigation_enabled:
+                logger.info("Greeting: obstacles-only mode")
+                await session.say("Object detection on. Point the camera ahead.")
+            elif app_navigation_enabled:
+                logger.info("Greeting: navigation mode")
+                await session.say(cfg.GREETING_PHRASE)
+            else:
+                # No mode data arrived at all — stay silent
+                logger.info("Greeting: no mode data received, skipping")
         except Exception as e:
             logger.debug("Greeting say: %s", e)
 
