@@ -108,6 +108,13 @@ class NavigationSession:
         self._route_started_at = time.monotonic()
         logger.info(f"Started navigation to {destination}")
 
+    def is_in_initial_nav_phase(self) -> bool:
+        """True during grace period after route start; obstacle alerts should not interrupt."""
+        if not self.active_route or self._route_started_at is None:
+            return False
+        elapsed = time.monotonic() - self._route_started_at
+        return elapsed < ROUTE_START_GRACE_SECONDS
+
     def stop_navigation(self):
         """Clear navigation session"""
         self.active_route = None

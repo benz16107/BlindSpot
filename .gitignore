@@ -4,6 +4,11 @@
 .env.*.local
 dart_defines.json
 
+# Agent: large model files (download via scripts/download_yolov8n_onnx.py)
+yolov8n.pt
+# Agent: local Backboard state
+.backboard.json
+
 # Miscellaneous
 *.class
 *.log

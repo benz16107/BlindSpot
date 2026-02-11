@@ -4,21 +4,19 @@ import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:camera/camera.dart';
-import 'package:flutter/foundation.dart' show kDebugMode, kIsWeb;
+import 'package:image/image.dart' as img;
+import 'package:flutter/foundation.dart' show kIsWeb, debugPrint;
 import 'package:flutter/material.dart';
 import 'package:flutter/semantics.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_compass/flutter_compass.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
 
 import 'config.dart';
 import 'voice_service.dart';
 import 'package:flutter_tts/flutter_tts.dart';
-import 'package:google_generative_ai/google_generative_ai.dart';
-import 'package:image/image.dart' as img;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -225,36 +223,37 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
   double? _heading;
   StreamSubscription<CompassEvent>? _compassSub;
 
-  // Voice agent: on when button pressed, off when pressed again; memory kept on server
+  // Navigation: voice agent + GPS for turn-by-turn
   final VoiceService _voiceService = VoiceService();
+  bool _navigationOn = false;
   bool _voiceConnecting = false;
   String? _voiceError;
 
-  // Mic level indicator: test when not connected to voice (record package)
+  // Mic level indicator: test when not connected (record package)
   final AudioRecorder _audioRecorder = AudioRecorder();
   bool _micTesting = false;
   double? _micLevel; // 0..1 normalized from dBFS
   StreamSubscription<Amplitude>? _micLevelSub;
 
-  // Obstacle detection: periodic frame upload, TTS + constant haptic when obstacle near
+  // Obstacle detection: can run with or without navigation; sends frames to agent
   bool _obstacleDetectionOn = false;
   Timer? _obstacleTimer;
-  Timer? _obstacleHapticTimer; // repeating haptic while obstacle near
-  bool _obstacleNear = false;
-  String? _obstacleDescription;
-  DateTime? _lastObstacleAnnounceTime; // TTS cooldown
-  final FlutterTts _tts = FlutterTts();
-  GenerativeModel? _obstacleModel; // cached for speed
-  bool _obstacleCheckInFlight = false; // prevent overlapping Gemini calls
+  Timer? _obstacleHapticTimer;
+  Timer?
+      _obstacleStaleTimer; // auto-clear if no update for a while (handles stuck)
+  bool _obstacleCheckInProgress = false;
+  bool _obstacleInFront = false;
+  String _obstacleDescription = '';
 
   @override
   void initState() {
     super.initState();
     _voiceService.addListener(_onVoiceStateChanged);
+    _voiceService.onObstacleFromAgent = _onObstacleFromAgent;
     _start();
   }
 
-  Future<void> _onVoiceButtonPressed() async {
+  Future<void> _onNavigationButtonPressed() async {
     HapticFeedback.selectionClick();
     if (_voiceConnecting) return;
     setState(() {
@@ -262,37 +261,42 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
       _voiceConnecting = true;
     });
     try {
-      if (_voiceService.isConnected) {
-        await _voiceService.disconnect();
+      if (_navigationOn) {
+        // Turn navigation OFF
+        setState(() => _navigationOn = false);
+        _voiceService.setNavigationEnabled(false);
+        _voiceService.publishAppMode(navigation: false, obstacles: _obstacleDetectionOn);
+        if (!_obstacleDetectionOn) {
+          await _voiceService.disconnect();
+        }
+        if (mounted) _announceToScreenReader('Navigation off.');
       } else {
-        await _voiceService.connect();
-      }
-      if (mounted) {
-        _announceToScreenReader(
-          _voiceService.isConnected
-              ? 'Voice agent connected. Say where you want to go or ask where you are.'
-              : 'Voice agent disconnected.',
-        );
+        // Turn navigation ON
+        if (!_voiceService.isConnected) {
+          await _voiceService.connect();
+        }
+        setState(() => _navigationOn = true);
+        _voiceService.setNavigationEnabled(true);
+        _voiceService.publishAppMode(navigation: true, obstacles: _obstacleDetectionOn);
+        if (mounted) _announceToScreenReader('Navigation on. Say where you want to go or ask where you are.');
       }
     } catch (e, st) {
-      debugPrint('Voice connect error: $e $st');
+      debugPrint('Navigation connect error: $e $st');
       if (mounted) {
         setState(() {
           _voiceError = e.toString();
         });
-        _announceToScreenReader('Voice connection failed. ${e.toString()}');
+        _announceToScreenReader('Connection failed. ${e.toString()}');
       }
     } finally {
-      if (mounted) {
-        setState(() => _voiceConnecting = false);
-      }
+      if (mounted) setState(() => _voiceConnecting = false);
     }
   }
 
   Future<void> _start() async {
     if (widget.cameras.isEmpty) {
       setState(() {
-        _status = "No camera (e.g. macOS). GPS + voice only.";
+        _status = "No camera (e.g. macOS). GPS + navigation only.";
         _initializing = false;
       });
       await _startLocation();
@@ -318,8 +322,6 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
         _initializing = false;
         _status = "Camera ready. Getting GPS…";
       });
-
-      // Obstacle detection starts only when user toggles it on (see FAB)
 
       // Start location after camera is ready (so UI feels responsive)
       await _startLocation();
@@ -379,14 +381,16 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
       });
       _voiceService.updateGps(first.latitude, first.longitude, _heading);
 
-      // 4) Compass updates (heading 0–360) — push to agent so nav uses current direction
+      // 4) Compass updates (heading 0–360) — push to agent immediately so nav uses current direction
       _compassSub?.cancel();
       _compassSub = FlutterCompass.events?.listen((CompassEvent e) {
         if (!mounted) return;
         if (e.heading != null) {
           setState(() => _heading = e.heading);
           if (_pos != null) {
-            _voiceService.updateGps(_pos!.latitude, _pos!.longitude, e.heading!);
+            _voiceService.updateGps(
+                _pos!.latitude, _pos!.longitude, e.heading!);
+            _voiceService.publishGpsNow();
           }
         }
       });
@@ -422,78 +426,175 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
 
   void _onVoiceStateChanged() {
     if (!mounted) return;
-    if (!_voiceService.isConnected && _obstacleDetectionOn) {
+    if (!_voiceService.isConnected) {
       _stopObstacleDetection();
-      setState(() => _obstacleDetectionOn = false);
     }
     setState(() {});
   }
 
-  /// Obstacle endpoint: same host as token URL from config (only used when not using local Gemini).
-  String get _obstacleFrameUrl {
-    final u = Uri.parse(
-        tokenUrl.trim().isEmpty ? 'http://localhost:8765/token' : tokenUrl);
-    return u.resolve('/obstacle-frame').toString();
-  }
-
-  void _startObstacleDetection() {
-    _obstacleTimer?.cancel();
-    final interval = Duration(milliseconds: obstacleCheckIntervalMs);
-    _obstacleTimer = Timer.periodic(interval, (_) => _runObstacleCheck());
-    _runObstacleCheck(); // run first check immediately
-  }
-
-  void _stopObstacleDetection() {
-    _obstacleTimer?.cancel();
-    _obstacleTimer = null;
-    _stopObstacleAlerts();
-    if (mounted) {
-      setState(() {
-        _obstacleNear = false;
-        _obstacleDescription = null;
-      });
+  void _onObstacleFromAgent(bool detected, String description) {
+    if (!mounted) return;
+    debugPrint('Obstacle: detected=$detected desc="$description"');
+    _obstacleStaleTimer?.cancel();
+    setState(() {
+      _obstacleInFront = detected;
+      _obstacleDescription = description;
+    });
+    if (detected) {
+      _startObstacleHaptics();
+      _obstacleStaleTimer = Timer(
+        const Duration(milliseconds: obstacleStaleClearMs),
+        () {
+          if (!mounted || !_obstacleDetectionOn) return;
+          _obstacleStaleTimer?.cancel();
+          _obstacleStaleTimer = null;
+          setState(() {
+            _obstacleInFront = false;
+            _obstacleDescription = '';
+          });
+          _stopObstacleHaptics();
+        },
+      );
+    } else {
+      _stopObstacleHaptics();
     }
   }
 
-  /// Constant haptic vibration while obstacle is detected.
-  void _startObstacleAlerts(String description) {
-    _obstacleHapticTimer?.cancel();
-    _obstacleHapticTimer =
-        Timer.periodic(Duration(milliseconds: obstacleHapticPeriodMs), (_) {
-      if (!_obstacleNear || !mounted) {
-        _stopObstacleAlerts();
+  Future<void> _startObstacleDetection() async {
+    if (_obstacleDetectionOn) return;
+    if (!_voiceService.isConnected) {
+      if (_voiceConnecting) return;
+      setState(() {
+        _voiceError = null;
+        _voiceConnecting = true;
+      });
+      try {
+        await _voiceService.connect();
+        _voiceService.setNavigationEnabled(_navigationOn);
+        if (mounted) setState(() {});
+      } catch (e, st) {
+        debugPrint('Obstacle connect error: $e $st');
+        if (mounted) {
+          setState(() {
+            _voiceError = e.toString();
+            _voiceConnecting = false;
+          });
+        }
         return;
+      } finally {
+        if (mounted) setState(() => _voiceConnecting = false);
       }
-      HapticFeedback.heavyImpact();
-    });
+    }
+    _obstacleDetectionOn = true;
+    _obstacleInFront = false;
+    _obstacleDescription = '';
+    _stopObstacleHaptics();
+    _voiceService.publishObstacleMode(true, navigation: _navigationOn);
+    _voiceService.publishAppMode(navigation: _navigationOn, obstacles: true);
+    _obstacleTimer?.cancel();
+    _obstacleTimer = Timer.periodic(
+      const Duration(milliseconds: obstacleCheckIntervalMs),
+      (_) => _runObstacleCheck(),
+    );
+    if (mounted) setState(() {});
   }
 
-  void _stopObstacleAlerts() {
+  void _stopObstacleDetection() {
+    if (!_obstacleDetectionOn) return;
+    _obstacleDetectionOn = false;
+    _obstacleInFront = false;
+    _obstacleDescription = '';
+    _obstacleTimer?.cancel();
+    _obstacleTimer = null;
+    _obstacleStaleTimer?.cancel();
+    _obstacleStaleTimer = null;
+    _stopObstacleHaptics();
+    _voiceService.publishObstacleMode(false, navigation: _navigationOn);
+    _voiceService.publishAppMode(navigation: _navigationOn, obstacles: false);
+    if (!_navigationOn && _voiceService.isConnected) {
+      _voiceService.disconnect();
+    }
+    if (mounted) setState(() {});
+  }
+
+  void _startObstacleHaptics() {
+    _obstacleHapticTimer?.cancel();
+    _obstacleHapticTimer = Timer.periodic(
+      const Duration(milliseconds: obstacleHapticPeriodMs),
+      (_) => HapticFeedback.heavyImpact(),
+    );
+  }
+
+  void _stopObstacleHaptics() {
     _obstacleHapticTimer?.cancel();
     _obstacleHapticTimer = null;
-    _tts.stop();
   }
 
-  Future<void> _announceObstacle(String description) async {
-    _lastObstacleAnnounceTime = DateTime.now();
-    final phrase = description.toLowerCase() == 'object' || description.isEmpty
-        ? 'Obstacle detected. Object in front.'
-        : 'Obstacle detected. $description in front.';
-    await _tts.speak(phrase);
+  Future<void> _runObstacleCheck() async {
+    final controller = _controller;
+    if (controller == null ||
+        !controller.value.isInitialized ||
+        !_obstacleDetectionOn) {
+      return;
+    }
+    if (_obstacleCheckInProgress) return;
+    _obstacleCheckInProgress = true;
+    try {
+      final XFile file = await controller.takePicture();
+      final bytes = await file.readAsBytes();
+      final resized = _resizeObstacleImage(bytes);
+      if (resized == null || resized.isEmpty) return;
+      final base64 = base64Encode(resized);
+      _voiceService.publishObstacleFrame(base64);
+    } catch (_) {
+    } finally {
+      if (mounted) _obstacleCheckInProgress = false;
+    }
+  }
+
+  /// LiveKit payload limit ~14KB; JSON wrapper + base64 adds overhead.
+  /// Target ~9KB raw JPEG so base64 + wrapper stays under 14KB.
+  static const int _obstacleMaxRawJpegBytes = 10000;
+
+  Uint8List? _resizeObstacleImage(Uint8List jpegBytes) {
+    try {
+      final decoded = img.decodeImage(jpegBytes);
+      if (decoded == null) return null;
+      // Center-crop to ~80% so path ahead uses more of the pixels we send
+      final w = decoded.width;
+      final h = decoded.height;
+      final cropW = (w * 0.8).round();
+      final cropH = (h * 0.8).round();
+      final x = (w - cropW) ~/ 2;
+      final y = (h - cropH) ~/ 2;
+      final cropped =
+          img.copyCrop(decoded, x: x, y: y, width: cropW, height: cropH);
+      final scale = obstacleImageMaxWidth / cropped.width;
+      final resized = img.copyResize(
+        cropped,
+        width: obstacleImageMaxWidth,
+        height: (cropped.height * scale).round(),
+      );
+      // Try quality down until under limit (phone cameras produce larger JPEGs)
+      for (final q in [obstacleJpegQuality, 35, 25, 20, 15]) {
+        final encoded = img.encodeJpg(resized, quality: q);
+        final bytes = Uint8List.fromList(encoded);
+        if (bytes.length <= _obstacleMaxRawJpegBytes) return bytes;
+      }
+      return null;
+    } catch (_) {
+      return null;
+    }
   }
 
   void _onObstacleDetectionToggle() {
     HapticFeedback.selectionClick();
     if (_obstacleDetectionOn) {
-      setState(() => _obstacleDetectionOn = false);
       _stopObstacleDetection();
-      _announceToScreenReader('Object detection turned off.');
+      _announceToScreenReader('Object detection off');
     } else {
-      if (!_voiceService.isConnected) return;
-      setState(() => _obstacleDetectionOn = true);
-      _startObstacleDetection();
-      _announceToScreenReader(
-          'Object detection turned on. You will feel vibrations and hear alerts when something is in front.');
+      unawaited(_startObstacleDetection());
+      _announceToScreenReader('Object detection on. Point camera ahead.');
     }
   }
 
@@ -502,183 +603,6 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
       SemanticsService.announce(message, TextDirection.ltr);
     } catch (_) {
       // Announce not supported on this platform
-    }
-  }
-
-  Future<void> _runObstacleCheck() async {
-    if (!_obstacleDetectionOn) return;
-    if (_obstacleCheckInFlight) return;
-    final controller = _controller;
-    if (!mounted || controller == null || !controller.value.isInitialized)
-      return;
-
-    _obstacleCheckInFlight = true;
-    try {
-      final xfile = await controller.takePicture();
-      List<int> bytes = await xfile.readAsBytes();
-      if (!mounted || bytes.isEmpty) {
-        debugPrint('Obstacle: no image bytes from camera');
-        _obstacleCheckInFlight = false;
-        return;
-      }
-
-      bytes = _resizeObstacleImage(bytes);
-      debugPrint('Obstacle: frame ${bytes.length} bytes');
-
-      Map<String, dynamic>? body;
-      if (useLocalObstacleDetection && googleApiKey.trim().isNotEmpty) {
-        body = await _analyzeObstacleLocal(bytes);
-      } else {
-        final url = _obstacleFrameUrl;
-        if (url.isEmpty) return;
-        final response = await http.post(
-          Uri.parse(url),
-          body: bytes,
-          headers: {'Content-Type': 'image/jpeg'},
-        ).timeout(Duration(seconds: obstacleRequestTimeoutSeconds));
-        if (!mounted) return;
-        if (response.statusCode != 200) {
-          setState(() {
-            _obstacleNear = false;
-            _obstacleDescription = null;
-          });
-          return;
-        }
-        body = jsonDecode(response.body) as Map<String, dynamic>?;
-      }
-
-      if (!mounted) {
-        _obstacleCheckInFlight = false;
-        return;
-      }
-      if (body == null) {
-        debugPrint('Obstacle: no result from Gemini/server');
-        _obstacleCheckInFlight = false;
-        return;
-      }
-      if (!_obstacleDetectionOn) return;
-      final detected = body['obstacle_detected'] == true;
-      final distance =
-          (body['distance'] as String? ?? '').toString().toLowerCase();
-      final description =
-          (body['description'] as String? ?? '').toString().trim();
-      final isNear = detected && obstacleAlertDistances.contains(distance);
-
-      if (!mounted || !_obstacleDetectionOn) return;
-      final wasNear = _obstacleNear;
-      setState(() {
-        _obstacleNear = isNear;
-        _obstacleDescription =
-            isNear ? (description.isNotEmpty ? description : 'obstacle') : null;
-      });
-      if (!_obstacleDetectionOn) return;
-      if (isNear) {
-        _startObstacleAlerts(description.isNotEmpty ? description : 'object');
-        final desc = description.isNotEmpty ? description : 'object';
-        final now = DateTime.now();
-        final shouldAnnounce = !wasNear ||
-            _lastObstacleAnnounceTime == null ||
-            now.difference(_lastObstacleAnnounceTime!) >
-                Duration(seconds: obstacleAnnounceCooldownSeconds);
-        if (shouldAnnounce) {
-          _lastObstacleAnnounceTime = now;
-          if (_voiceService.isConnected) {
-            _voiceService.publishObstacleDetected(desc);
-          } else {
-            _announceObstacle(desc);
-          }
-        }
-      } else {
-        _stopObstacleAlerts();
-      }
-    } catch (e) {
-      debugPrint('Obstacle check error: $e');
-      if (mounted && _obstacleDetectionOn) {
-        setState(() {
-          _obstacleNear = false;
-          _obstacleDescription = null;
-        });
-      }
-    } finally {
-      _obstacleCheckInFlight = false;
-    }
-  }
-
-  /// Resize JPEG for fast upload and inference.
-  List<int> _resizeObstacleImage(List<int> imageBytes) {
-    if (obstacleImageMaxWidth <= 0) return imageBytes;
-    try {
-      final decoded = img.decodeImage(Uint8List.fromList(imageBytes));
-      if (decoded == null || decoded.width <= obstacleImageMaxWidth)
-        return imageBytes;
-      final resized = img.copyResize(decoded, width: obstacleImageMaxWidth);
-      final encoded = img.encodeJpg(resized, quality: obstacleJpegQuality);
-      return encoded;
-    } catch (_) {
-      return imageBytes;
-    }
-  }
-
-  /// Call Gemini API directly from the app (no obstacle server). Model cached for speed.
-  Future<Map<String, dynamic>?> _analyzeObstacleLocal(
-      List<int> imageBytes) async {
-    if (imageBytes.isEmpty) {
-      debugPrint('Obstacle Gemini: skipped empty image');
-      return null;
-    }
-    try {
-      _obstacleModel ??= GenerativeModel(
-        model: obstacleModel,
-        apiKey: googleApiKey.trim(),
-        generationConfig: GenerationConfig(
-          responseMimeType: 'application/json',
-          temperature: obstacleTemperature,
-          maxOutputTokens: obstacleMaxOutputTokens,
-        ),
-      );
-      final response = await _obstacleModel!.generateContent([
-        Content.multi([
-          DataPart('image/jpeg', Uint8List.fromList(imageBytes)),
-          TextPart(obstaclePrompt),
-        ]),
-      ]);
-      final text = response.text?.trim() ?? '';
-      if (text.isEmpty) {
-        debugPrint(
-            'Obstacle Gemini: empty response (candidates: ${response.candidates.length})');
-        return null;
-      }
-      String jsonStr = text;
-      if (text.contains('```')) {
-        final start = text.indexOf('{');
-        final end = text.lastIndexOf('}') + 1;
-        if (start >= 0 && end > start) jsonStr = text.substring(start, end);
-      }
-      final out = jsonDecode(jsonStr) as Map<String, dynamic>?;
-      if (out == null) return null;
-      if (kDebugMode) {
-        debugPrint('Obstacle Gemini: $out');
-      }
-      final detected = out['obstacle_detected'];
-      bool det;
-      if (detected is bool) {
-        det = detected;
-      } else if (detected is String) {
-        det = ['true', '1', 'yes'].contains(detected.toLowerCase());
-      } else {
-        det = false;
-      }
-      var dist = (out['distance'] as String? ?? '').toString().toLowerCase();
-      if (dist != 'far' && dist != 'medium' && dist != 'near')
-        dist = det ? 'medium' : 'none';
-      return {
-        'obstacle_detected': det,
-        'distance': dist,
-        'description': (out['description'] as String? ?? '').toString().trim(),
-      };
-    } catch (e) {
-      debugPrint('_analyzeObstacleLocal: $e');
-      return null;
     }
   }
 
@@ -742,12 +666,10 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
 
   @override
   void dispose() {
-    _obstacleTimer?.cancel();
-    _obstacleTimer = null;
-    _obstacleHapticTimer?.cancel();
-    _obstacleHapticTimer = null;
+    _stopObstacleDetection();
     _stopMicTest();
     _voiceService.removeListener(_onVoiceStateChanged);
+    _voiceService.onObstacleFromAgent = null;
     _voiceService.disconnect();
     _posSub?.cancel();
     _compassSub?.cancel();
@@ -786,21 +708,19 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
   /// Single-sentence summary for screen reader (status card).
   String _statusSummaryForAccessibility() {
     final parts = <String>[_status, _locationLine()];
-    if (_obstacleNear && _obstacleDescription != null) {
-      parts.add('Obstacle in front: $_obstacleDescription');
-    }
     if (_voiceError != null) {
-      parts.add('Voice error: $_voiceError');
+      parts.add('Connection error: $_voiceError');
     } else if (_voiceConnecting) {
-      parts.add('Voice: connecting');
+      parts.add('Connecting');
     } else if (_voiceService.isConnected) {
-      parts.add('Voice agent: on');
+      parts.add('Navigation: ${_navigationOn ? "on" : "off"}');
+      parts.add('Object detection: ${_obstacleDetectionOn ? "on" : "off"}');
     } else {
-      parts.add('Voice agent: off');
+      parts.add('Not connected');
     }
-    parts.add(_obstacleDetectionOn
-        ? 'Object detection: on'
-        : 'Object detection: off');
+    if (_obstacleDetectionOn && _obstacleInFront) {
+      parts.add('Obstacle ahead: $_obstacleDescription');
+    }
     return parts.join('. ');
   }
 
@@ -815,495 +735,479 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
           ? Container(
               color: Colors.black,
               alignment: Alignment.center,
-              child:
-                  Text(_status, style: const TextStyle(color: Colors.white)),
+              child: Text(_status, style: const TextStyle(color: Colors.white)),
             )
           : Stack(
               children: [
-                Positioned.fill(
-                  child: showCamera
-                        ? ExcludeSemantics(
-                            child: _CameraPreviewFullScreen(
-                                controller: controller),
-                          )
-                        : Container(
-                            color: Colors.black,
-                            alignment: Alignment.center,
-                            child: Column(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                const SizedBox(
-                                  width: 32,
-                                  height: 32,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 3,
-                                    color: Colors.white54,
-                                  ),
-                                ),
-                                const SizedBox(height: 16),
-                                Text(_status,
-                                    style: TextStyle(
-                                        color: Colors.white.withOpacity(0.8),
-                                        fontSize: 16)),
-                              ],
-                            ),
-                          ),
-                ),
-
-                  // Status + GPS overlay — inset by safe area (hole punch, status bar)
+                // Obstacle warning overlay
+                if (_obstacleInFront && _obstacleDescription.isNotEmpty)
                   Positioned(
-                    left: 16 + padding.left,
-                    right: 16 + padding.right,
-                    top: 16 + padding.top,
+                    left: 24 + padding.left,
+                    right: 24 + padding.right,
+                    bottom: 140 + padding.bottom,
                     child: Semantics(
-                      container: true,
-                      label: _statusSummaryForAccessibility(),
+                      liveRegion: true,
+                      label: 'Obstacle ahead: $_obstacleDescription',
                       child: Container(
                         padding: const EdgeInsets.symmetric(
-                            horizontal: 16, vertical: 14),
+                            horizontal: 20, vertical: 16),
                         decoration: BoxDecoration(
-                          color: Colors.black.withOpacity(0.68),
-                          borderRadius: BorderRadius.circular(20),
-                          border: Border.all(
-                              color: Colors.white.withOpacity(0.4), width: 1),
+                          color: Colors.orange.shade700.withOpacity(0.95),
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(color: Colors.white, width: 2),
                         ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
+                        child: Row(
                           children: [
-                            Row(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      Text(
-                                        _status,
-                                        style: const TextStyle(
-                                          color: Colors.white,
-                                          fontSize: 16,
-                                          fontWeight: FontWeight.w600,
-                                          letterSpacing: -0.2,
-                                        ),
-                                      ),
-                                      const SizedBox(height: 8),
-                                      Text(
-                                        _locationLine(),
-                                        style: TextStyle(
-                                          color: Colors.white.withOpacity(0.9),
-                                          fontSize: 14,
-                                          fontWeight: FontWeight.w400,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
+                            const Icon(Icons.warning_amber_rounded,
+                                size: 36, color: Colors.white),
+                            const SizedBox(width: 16),
+                            Expanded(
+                              child: Text(
+                                'Obstacle: $_obstacleDescription',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 20,
+                                  fontWeight: FontWeight.bold,
                                 ),
-                                if (_heading != null) ...[
-                                  const SizedBox(width: 12),
-                                  Semantics(
-                                    label: _headingLabel(_heading!),
-                                    container: true,
-                                    child: _CompassWidget(heading: _heading!),
-                                  ),
-                                ],
-                              ],
+                              ),
                             ),
-                            if (_obstacleNear &&
-                                _obstacleDescription != null) ...[
-                              const SizedBox(height: 10),
-                              Row(
-                                children: [
-                                  Icon(Icons.warning_amber_rounded,
-                                      color: Colors.amber.shade200, size: 20),
-                                  const SizedBox(width: 8),
-                                  Expanded(
-                                    child: Text(
-                                      'Obstacle: $_obstacleDescription',
-                                      style: TextStyle(
-                                        color: Colors.amber.shade100,
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                Positioned.fill(
+                  child: showCamera
+                      ? ExcludeSemantics(
+                          child:
+                              _CameraPreviewFullScreen(controller: controller),
+                        )
+                      : Container(
+                          color: Colors.black,
+                          alignment: Alignment.center,
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const SizedBox(
+                                width: 32,
+                                height: 32,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 3,
+                                  color: Colors.white54,
+                                ),
+                              ),
+                              const SizedBox(height: 16),
+                              Text(_status,
+                                  style: TextStyle(
+                                      color: Colors.white.withOpacity(0.8),
+                                      fontSize: 16)),
+                            ],
+                          ),
+                        ),
+                ),
+
+                // Status + GPS overlay — inset by safe area (hole punch, status bar)
+                Positioned(
+                  left: 16 + padding.left,
+                  right: 16 + padding.right,
+                  top: 16 + padding.top,
+                  child: Semantics(
+                    container: true,
+                    label: _statusSummaryForAccessibility(),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 16, vertical: 14),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withOpacity(0.68),
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(
+                            color: Colors.white.withOpacity(0.4), width: 1),
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Text(
+                                      _status,
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 16,
                                         fontWeight: FontWeight.w600,
-                                        fontSize: 14,
+                                        letterSpacing: -0.2,
                                       ),
                                     ),
-                                  ),
-                                ],
+                                    const SizedBox(height: 8),
+                                    Text(
+                                      _locationLine(),
+                                      style: TextStyle(
+                                        color: Colors.white.withOpacity(0.9),
+                                        fontSize: 14,
+                                        fontWeight: FontWeight.w400,
+                                      ),
+                                    ),
+                                  ],
+                                ),
                               ),
+                              if (_heading != null) ...[
+                                const SizedBox(width: 12),
+                                Semantics(
+                                  label: _headingLabel(_heading!),
+                                  container: true,
+                                  child: _CompassWidget(heading: _heading!),
+                                ),
+                              ],
                             ],
-                            if (_voiceError != null) ...[
-                              const SizedBox(height: 10),
-                              Text(
-                                'Voice: $_voiceError',
-                                style: TextStyle(
-                                    color: Colors.red.shade200, fontSize: 14),
+                          ),
+                          if (_voiceError != null) ...[
+                            const SizedBox(height: 10),
+                            Text(
+                              'Connection: $_voiceError',
+                              style: TextStyle(
+                                  color: Colors.red.shade200, fontSize: 14),
+                            ),
+                          ] else ...[
+                            const SizedBox(height: 10),
+                            Text(
+                              _voiceConnecting
+                                  ? 'Connecting…'
+                                  : _voiceService.isConnected
+                                      ? 'Connected'
+                                      : 'Tap Navigation or Obstacles to start',
+                              style: TextStyle(
+                                color: Colors.white.withOpacity(0.9),
+                                fontSize: 14,
+                                fontWeight: FontWeight.w500,
                               ),
-                            ] else ...[
-                              const SizedBox(height: 10),
+                            ),
+                            if (_obstacleDetectionOn) ...[
+                              const SizedBox(height: 4),
                               Text(
-                                _voiceConnecting
-                                    ? 'Voice: connecting…'
-                                    : _voiceService.isConnected
-                                        ? 'Voice: on'
-                                        : 'Voice: off (tap mic to start)',
+                                _obstacleInFront
+                                    ? 'Obstacle: $_obstacleDescription'
+                                    : 'Object detection: scanning',
                                 style: TextStyle(
                                   color: Colors.white.withOpacity(0.9),
                                   fontSize: 14,
                                   fontWeight: FontWeight.w500,
                                 ),
                               ),
-                              // Mic level: test when not connected, or "live" when connected
-                              const SizedBox(height: 10),
-                              if (_micTesting) ...[
-                                Row(
-                                  children: [
-                                    SizedBox(
-                                      width: 100,
-                                      height: 6,
-                                      child: ClipRRect(
-                                        borderRadius: BorderRadius.circular(3),
-                                        child: LinearProgressIndicator(
-                                          value: _micLevel ?? 0,
-                                          backgroundColor:
-                                              Colors.white.withOpacity(0.25),
-                                          valueColor:
-                                              const AlwaysStoppedAnimation<
-                                                  Color>(Color(0xFF34C759)),
-                                        ),
-                                      ),
-                                    ),
-                                    const SizedBox(width: 10),
-                                    Text(
-                                      'Mic: ${((_micLevel ?? 0) * 100).toStringAsFixed(0)}%',
-                                      style: TextStyle(
-                                          color: Colors.white.withOpacity(0.9),
-                                          fontSize: 13),
-                                    ),
-                                    const Spacer(),
-                                    Semantics(
-                                      label: 'Stop mic test',
-                                      hint: 'Double tap to stop listening',
-                                      button: true,
-                                      child: GestureDetector(
-                                        onTap: _stopMicTest,
-                                        behavior: HitTestBehavior.opaque,
-                                        child: Container(
-                                          padding: const EdgeInsets.symmetric(
-                                              horizontal: 14, vertical: 10),
-                                          decoration: BoxDecoration(
-                                            color:
-                                                Colors.white.withOpacity(0.25),
-                                            borderRadius:
-                                                BorderRadius.circular(12),
-                                          ),
-                                          child: const Text('Stop',
-                                              style: TextStyle(
-                                                  color: Colors.white,
-                                                  fontSize: 15,
-                                                  fontWeight: FontWeight.w600)),
-                                        ),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                                const SizedBox(height: 4),
-                                Text(
-                                  'Listening… speak to test (stops in 15s or tap Stop)',
-                                  style: TextStyle(
-                                      color: Colors.white.withOpacity(0.7),
-                                      fontSize: 12),
-                                ),
-                              ] else if (!_voiceService.isConnected &&
-                                  !_voiceConnecting) ...[
-                                Semantics(
-                                  label: 'Test mic level',
-                                  hint:
-                                      'Double tap to test your microphone before connecting',
-                                  button: true,
-                                  child: GestureDetector(
-                                    onTap: _startMicTest,
-                                    behavior: HitTestBehavior.opaque,
-                                    child: Container(
-                                      padding: const EdgeInsets.symmetric(
-                                          horizontal: 16, vertical: 12),
-                                      decoration: BoxDecoration(
-                                        color: Colors.white.withOpacity(0.2),
-                                        borderRadius: BorderRadius.circular(12),
-                                        border: Border.all(
-                                            color:
-                                                Colors.white.withOpacity(0.3)),
-                                      ),
-                                      child: const Row(
-                                        mainAxisSize: MainAxisSize.min,
-                                        children: [
-                                          Icon(Icons.mic_none,
-                                              size: 20, color: Colors.white),
-                                          SizedBox(width: 10),
-                                          Text('Test mic level',
-                                              style: TextStyle(
-                                                  color: Colors.white,
-                                                  fontSize: 15,
-                                                  fontWeight: FontWeight.w500)),
-                                        ],
-                                      ),
-                                    ),
-                                  ),
-                                ),
-                              ] else if (_voiceService.isConnected) ...[
-                                Row(
-                                  children: [
-                                    Container(
-                                      width: 8,
-                                      height: 8,
-                                      decoration: BoxDecoration(
-                                        color: const Color(0xFF34C759),
-                                        shape: BoxShape.circle,
-                                        boxShadow: [
-                                          BoxShadow(
-                                              color: const Color(0xFF34C759)
-                                                  .withOpacity(0.6),
-                                              blurRadius: 6)
-                                        ],
-                                      ),
-                                    ),
-                                    const SizedBox(width: 8),
-                                    Text(
-                                      'Mic live (sending to agent)',
-                                      style: TextStyle(
-                                          color: Colors.white.withOpacity(0.9),
-                                          fontSize: 13,
-                                          fontWeight: FontWeight.w500),
-                                    ),
-                                  ],
-                                ),
-                              ],
-                              const SizedBox(height: 10),
+                            ],
+                            // Mic level: test when not connected, or "live" when connected
+                            const SizedBox(height: 10),
+                            if (_micTesting) ...[
                               Row(
                                 children: [
-                                  Icon(
-                                    Icons.warning_amber_rounded,
-                                    size: 16,
-                                    color: _obstacleDetectionOn
-                                        ? Colors.amber.shade200
-                                        : Colors.white.withOpacity(0.7),
-                                  ),
-                                  const SizedBox(width: 6),
-                                  Expanded(
-                                    child: Text(
-                                      _obstacleDetectionOn
-                                          ? 'Object detection: on'
-                                          : _voiceService.isConnected
-                                              ? 'Object detection: off (tap ⚠ to turn on)'
-                                              : 'Object detection: connect voice first',
-                                      style: TextStyle(
-                                        color: _obstacleDetectionOn
-                                            ? Colors.amber.shade100
-                                            : Colors.white.withOpacity(0.8),
-                                        fontSize: 13,
-                                        fontWeight: FontWeight.w500,
+                                  SizedBox(
+                                    width: 100,
+                                    height: 6,
+                                    child: ClipRRect(
+                                      borderRadius: BorderRadius.circular(3),
+                                      child: LinearProgressIndicator(
+                                        value: _micLevel ?? 0,
+                                        backgroundColor:
+                                            Colors.white.withOpacity(0.25),
+                                        valueColor:
+                                            const AlwaysStoppedAnimation<Color>(
+                                                Color(0xFF34C759)),
                                       ),
                                     ),
                                   ),
-                                ],
-                              ),
-                              if (kIsWeb &&
-                                  !_voiceService.isConnected &&
-                                  !_voiceConnecting) ...[
-                                const SizedBox(height: 6),
-                                Text(
-                                  'Chrome: allow mic when prompted. After connecting, tap "Tap to enable speaker" if you can\'t hear.',
-                                  style: TextStyle(
-                                      color: Colors.white.withOpacity(0.7),
-                                      fontSize: 12),
-                                ),
-                              ],
-                              if (_voiceService.audioPlaybackFailed ||
-                                  (kIsWeb && _voiceService.isConnected)) ...[
-                                if (kIsWeb) ...[
-                                  const SizedBox(height: 8),
+                                  const SizedBox(width: 10),
                                   Text(
-                                    'Chrome: allow microphone when prompted. If you can\'t hear the agent, tap below.',
+                                    'Mic: ${((_micLevel ?? 0) * 100).toStringAsFixed(0)}%',
                                     style: TextStyle(
                                         color: Colors.white.withOpacity(0.9),
                                         fontSize: 13),
                                   ),
-                                ],
-                                const SizedBox(height: 10),
-                                Semantics(
-                                  label: _voiceService.audioPlaybackFailed
-                                      ? 'Tap to enable speaker. Required in Chrome to hear the agent.'
-                                      : 'Tap to enable speaker',
-                                  hint: 'Double tap to unlock audio playback',
-                                  button: true,
-                                  child: GestureDetector(
-                                    onTap: () async {
-                                      HapticFeedback.selectionClick();
-                                      await _voiceService.playbackAudio();
-                                    },
-                                    behavior: HitTestBehavior.opaque,
-                                    child: Container(
-                                      padding: const EdgeInsets.symmetric(
-                                          horizontal: 16, vertical: 14),
-                                      decoration: BoxDecoration(
-                                        color: Colors.orange.shade400
-                                            .withOpacity(0.9),
-                                        borderRadius: BorderRadius.circular(12),
-                                        border: Border.all(
-                                            color:
-                                                Colors.white.withOpacity(0.2)),
-                                      ),
-                                      child: Center(
-                                        child: Text(
-                                          _voiceService.audioPlaybackFailed
-                                              ? 'Tap to enable speaker (Chrome)'
-                                              : 'Tap to enable speaker',
-                                          style: const TextStyle(
-                                              color: Colors.white,
-                                              fontSize: 16,
-                                              fontWeight: FontWeight.w600),
+                                  const Spacer(),
+                                  Semantics(
+                                    label: 'Stop mic test',
+                                    hint: 'Double tap to stop listening',
+                                    button: true,
+                                    child: GestureDetector(
+                                      onTap: _stopMicTest,
+                                      behavior: HitTestBehavior.opaque,
+                                      child: Container(
+                                        padding: const EdgeInsets.symmetric(
+                                            horizontal: 14, vertical: 10),
+                                        decoration: BoxDecoration(
+                                          color: Colors.white.withOpacity(0.25),
+                                          borderRadius:
+                                              BorderRadius.circular(12),
                                         ),
+                                        child: const Text('Stop',
+                                            style: TextStyle(
+                                                color: Colors.white,
+                                                fontSize: 15,
+                                                fontWeight: FontWeight.w600)),
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                'Listening… speak to test (stops in 15s or tap Stop)',
+                                style: TextStyle(
+                                    color: Colors.white.withOpacity(0.7),
+                                    fontSize: 12),
+                              ),
+                            ] else if (!_voiceService.isConnected &&
+                                !_voiceConnecting) ...[
+                              Semantics(
+                                label: 'Test mic level',
+                                hint:
+                                    'Double tap to test your microphone before connecting',
+                                button: true,
+                                child: GestureDetector(
+                                  onTap: _startMicTest,
+                                  behavior: HitTestBehavior.opaque,
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(
+                                        horizontal: 16, vertical: 12),
+                                    decoration: BoxDecoration(
+                                      color: Colors.white.withOpacity(0.2),
+                                      borderRadius: BorderRadius.circular(12),
+                                      border: Border.all(
+                                          color: Colors.white.withOpacity(0.3)),
+                                    ),
+                                    child: const Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Icon(Icons.mic_none,
+                                            size: 20, color: Colors.white),
+                                        SizedBox(width: 10),
+                                        Text('Test mic level',
+                                            style: TextStyle(
+                                                color: Colors.white,
+                                                fontSize: 15,
+                                                fontWeight: FontWeight.w500)),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ] else if (_voiceService.isConnected) ...[
+                              Row(
+                                children: [
+                                  Container(
+                                    width: 8,
+                                    height: 8,
+                                    decoration: BoxDecoration(
+                                      color: const Color(0xFF34C759),
+                                      shape: BoxShape.circle,
+                                      boxShadow: [
+                                        BoxShadow(
+                                            color: const Color(0xFF34C759)
+                                                .withOpacity(0.6),
+                                            blurRadius: 6)
+                                      ],
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Text(
+                                    'Mic live (sending to agent)',
+                                    style: TextStyle(
+                                        color: Colors.white.withOpacity(0.9),
+                                        fontSize: 13,
+                                        fontWeight: FontWeight.w500),
+                                  ),
+                                ],
+                              ),
+                            ],
+                            if (kIsWeb &&
+                                !_voiceService.isConnected &&
+                                !_voiceConnecting) ...[
+                              const SizedBox(height: 6),
+                              Text(
+                                'Chrome: allow mic when prompted. After connecting, tap "Tap to enable speaker" if you can\'t hear.',
+                                style: TextStyle(
+                                    color: Colors.white.withOpacity(0.7),
+                                    fontSize: 12),
+                              ),
+                            ],
+                            if (_voiceService.audioPlaybackFailed ||
+                                (kIsWeb && _voiceService.isConnected)) ...[
+                              if (kIsWeb) ...[
+                                const SizedBox(height: 8),
+                                Text(
+                                  'Chrome: allow microphone when prompted. If you can\'t hear the agent, tap below.',
+                                  style: TextStyle(
+                                      color: Colors.white.withOpacity(0.9),
+                                      fontSize: 13),
+                                ),
+                              ],
+                              const SizedBox(height: 10),
+                              Semantics(
+                                label: _voiceService.audioPlaybackFailed
+                                    ? 'Tap to enable speaker. Required in Chrome to hear the agent.'
+                                    : 'Tap to enable speaker',
+                                hint: 'Double tap to unlock audio playback',
+                                button: true,
+                                child: GestureDetector(
+                                  onTap: () async {
+                                    HapticFeedback.selectionClick();
+                                    await _voiceService.playbackAudio();
+                                  },
+                                  behavior: HitTestBehavior.opaque,
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(
+                                        horizontal: 16, vertical: 14),
+                                    decoration: BoxDecoration(
+                                      color: Colors.orange.shade400
+                                          .withOpacity(0.9),
+                                      borderRadius: BorderRadius.circular(12),
+                                      border: Border.all(
+                                          color: Colors.white.withOpacity(0.2)),
+                                    ),
+                                    child: Center(
+                                      child: Text(
+                                        _voiceService.audioPlaybackFailed
+                                            ? 'Tap to enable speaker (Chrome)'
+                                            : 'Tap to enable speaker',
+                                        style: const TextStyle(
+                                            color: Colors.white,
+                                            fontSize: 16,
+                                            fontWeight: FontWeight.w600),
                                       ),
                                     ),
                                   ),
                                 ),
-                              ],
+                              ),
                             ],
                           ],
-                        ),
+                        ],
                       ),
                     ),
                   ),
+                ),
 
-                  // Bottom bar — inset by safe area (nav bar)
-                  Positioned(
-                    left: 16 + padding.left,
-                    right: 16 + padding.right,
-                    bottom: 20 + padding.bottom,
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(32),
-                      child: BackdropFilter(
-                        filter: ui.ImageFilter.blur(sigmaX: 14, sigmaY: 14),
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 10, vertical: 10),
-                          decoration: BoxDecoration(
-                            color: Colors.black.withOpacity(0.55),
-                            borderRadius: BorderRadius.circular(32),
-                            border: Border.all(
-                                color: Colors.white.withOpacity(0.45), width: 1),
-                            boxShadow: [
-                              BoxShadow(
-                                color: Colors.black.withOpacity(0.35),
-                                blurRadius: 20,
-                                offset: const Offset(0, 8),
-                              ),
-                            ],
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              // Voice — left
-                              Expanded(
-                                child: Semantics(
-                                  label: _voiceConnecting
-                                      ? 'Voice agent. Connecting.'
-                                      : (_voiceService.isConnected
-                                          ? 'Voice agent. On. Double tap to disconnect.'
-                                          : 'Voice agent. Off. Double tap to connect.'),
-                                  hint: _voiceConnecting
-                                      ? null
-                                      : 'Double tap to turn voice assistant on or off',
-                                  button: true,
-                                  enabled: !_voiceConnecting,
-                                  child: Material(
-                                    color: _voiceService.isConnected &&
-                                            !_voiceConnecting
-                                        ? const Color(0xFF34C759).withOpacity(0.5)
-                                        : Colors.transparent,
+                // Bottom bar — inset by safe area (nav bar)
+                Positioned(
+                  left: 16 + padding.left,
+                  right: 16 + padding.right,
+                  bottom: 20 + padding.bottom,
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(32),
+                    child: BackdropFilter(
+                      filter: ui.ImageFilter.blur(sigmaX: 14, sigmaY: 14),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 10),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withOpacity(0.55),
+                          borderRadius: BorderRadius.circular(32),
+                          border: Border.all(
+                              color: Colors.white.withOpacity(0.45), width: 1),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withOpacity(0.35),
+                              blurRadius: 20,
+                              offset: const Offset(0, 8),
+                            ),
+                          ],
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            // Navigation — left
+                            Expanded(
+                              child: Semantics(
+                                label: _voiceConnecting
+                                    ? 'Navigation. Connecting.'
+                                    : (_navigationOn
+                                        ? 'Navigation. On. Double tap to turn off.'
+                                        : 'Navigation. Off. Double tap to turn on.'),
+                                hint: _voiceConnecting
+                                    ? null
+                                    : 'Double tap to turn navigation on or off',
+                                button: true,
+                                enabled: !_voiceConnecting,
+                                child: Material(
+                                  color: _navigationOn && !_voiceConnecting
+                                      ? const Color(0xFF34C759).withOpacity(0.5)
+                                      : Colors.transparent,
+                                  borderRadius: BorderRadius.circular(26),
+                                  child: InkWell(
+                                    onTap: _voiceConnecting
+                                        ? null
+                                        : _onNavigationButtonPressed,
                                     borderRadius: BorderRadius.circular(26),
-                                    child: InkWell(
-                                      onTap: _voiceConnecting
-                                          ? null
-                                          : _onVoiceButtonPressed,
-                                      borderRadius: BorderRadius.circular(26),
-                                      child: Container(
-                                        padding: const EdgeInsets.symmetric(
-                                            vertical: 48, horizontal: 16),
-                                        alignment: Alignment.center,
-                                        child: _voiceConnecting
-                                            ? const SizedBox(
-                                                width: 36,
-                                                height: 36,
-                                                child: CircularProgressIndicator(
-                                                  strokeWidth: 2.5,
-                                                  color: Colors.white,
+                                    child: Container(
+                                      padding: const EdgeInsets.symmetric(
+                                          vertical: 48, horizontal: 16),
+                                      alignment: Alignment.center,
+                                      child: _voiceConnecting &&
+                                              !_voiceService.isConnected
+                                          ? const SizedBox(
+                                              width: 36,
+                                              height: 36,
+                                              child: CircularProgressIndicator(
+                                                strokeWidth: 2.5,
+                                                color: Colors.white,
+                                              ),
+                                            )
+                                          : Row(
+                                              mainAxisAlignment:
+                                                  MainAxisAlignment.center,
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                Icon(
+                                                  Icons.navigation_rounded,
+                                                  size: 36,
+                                                  color: _navigationOn
+                                                      ? Colors.white
+                                                      : Colors.white
+                                                          .withOpacity(0.9),
                                                 ),
-                                              )
-                                            : Row(
-                                                mainAxisAlignment:
-                                                    MainAxisAlignment.center,
-                                                mainAxisSize: MainAxisSize.min,
-                                                children: [
-                                                  Icon(
-                                                    Icons.mic_rounded,
-                                                    size: 36,
-                                                    color:
-                                                        _voiceService.isConnected
-                                                            ? Colors.white
-                                                            : Colors.white
-                                                                .withOpacity(0.9),
-                                                  ),
-                                                  const SizedBox(width: 10),
-                                                  Flexible(
-                                                    child: Text(
-                                                      'Voice',
-                                                      overflow: TextOverflow.ellipsis,
-                                                      style: TextStyle(
-                                                        fontSize: 22,
-                                                        fontWeight: FontWeight.w600,
-                                                        color: _voiceService
-                                                                .isConnected
-                                                            ? Colors.white
-                                                            : Colors.white
-                                                                .withOpacity(0.9),
-                                                      ),
+                                                const SizedBox(width: 10),
+                                                Flexible(
+                                                  child: Text(
+                                                    'Navigation',
+                                                    overflow:
+                                                        TextOverflow.ellipsis,
+                                                    style: TextStyle(
+                                                      fontSize: 22,
+                                                      fontWeight:
+                                                          FontWeight.w600,
+                                                      color: _navigationOn
+                                                          ? Colors.white
+                                                          : Colors.white
+                                                              .withOpacity(0.9),
                                                     ),
                                                   ),
-                                                ],
-                                              ),
-                                      ),
+                                                ),
+                                              ],
+                                            ),
                                     ),
                                   ),
                                 ),
                               ),
-                              Container(
-                                width: 1,
-                                margin: const EdgeInsets.symmetric(horizontal: 6),
-                                color: Colors.white.withOpacity(0.4),
-                              ),
-                              // Obstacles — right
+                            ),
+                            // Obstacles — right (always shown)
+                            ...[
+                              const SizedBox(width: 8),
                               Expanded(
                                 child: Semantics(
-                                  label: _voiceService.isConnected
-                                      ? (_obstacleDetectionOn
-                                          ? 'Object detection. On. Double tap to turn off.'
-                                          : 'Object detection. Off. Double tap to turn on.')
-                                      : 'Object detection. Connect voice first.',
-                                  hint: _voiceService.isConnected
-                                      ? 'Double tap to toggle obstacle alerts'
-                                      : null,
+                                  label: _obstacleDetectionOn
+                                      ? 'Object detection. On. Double tap to turn off.'
+                                      : 'Object detection. Off. Double tap to turn on.',
+                                  hint: 'Double tap to detect obstacles ahead',
                                   button: true,
-                                  enabled: _voiceService.isConnected,
                                   child: Material(
-                                    color: _obstacleDetectionOn &&
-                                            _voiceService.isConnected
-                                        ? Colors.orange.withOpacity(0.45)
+                                    color: _obstacleDetectionOn
+                                        ? Colors.orange.withOpacity(0.5)
                                         : Colors.transparent,
                                     borderRadius: BorderRadius.circular(26),
                                     child: InkWell(
-                                      onTap: _voiceService.isConnected
-                                          ? _onObstacleDetectionToggle
-                                          : null,
+                                      onTap: _onObstacleDetectionToggle,
                                       borderRadius: BorderRadius.circular(26),
                                       child: Container(
                                         padding: const EdgeInsets.symmetric(
@@ -1317,12 +1221,10 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                             Icon(
                                               Icons.warning_amber_rounded,
                                               size: 36,
-                                              color: _voiceService.isConnected
-                                                  ? (_obstacleDetectionOn
-                                                      ? Colors.white
-                                                      : Colors.white
-                                                          .withOpacity(0.85))
-                                                  : Colors.white.withOpacity(0.4),
+                                              color: _obstacleDetectionOn
+                                                  ? Colors.white
+                                                  : Colors.white
+                                                      .withOpacity(0.9),
                                             ),
                                             const SizedBox(width: 10),
                                             Flexible(
@@ -1332,13 +1234,10 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                                 style: TextStyle(
                                                   fontSize: 22,
                                                   fontWeight: FontWeight.w600,
-                                                  color: _voiceService.isConnected
-                                                      ? (_obstacleDetectionOn
-                                                          ? Colors.white
-                                                          : Colors.white
-                                                              .withOpacity(0.9))
+                                                  color: _obstacleDetectionOn
+                                                      ? Colors.white
                                                       : Colors.white
-                                                          .withOpacity(0.4),
+                                                          .withOpacity(0.9),
                                                 ),
                                               ),
                                             ),
@@ -1350,11 +1249,12 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                 ),
                               ),
                             ],
-                          ),
+                          ],
                         ),
                       ),
                     ),
                   ),
+                ),
               ],
             ),
     );
@@ -1458,7 +1358,7 @@ class _CompassPainter extends CustomPainter {
     final radius = size.width / 2 - 4;
 
     // Cardinal labels (N at top; compass is fixed, needle rotates)
-    final textPainter = (String label, double angleDeg) {
+    void textPainter(String label, double angleDeg) {
       final rad = (angleDeg - 90) * math.pi / 180;
       final pos = center +
           Offset(radius * 0.75 * math.cos(rad), radius * 0.75 * math.sin(rad));
@@ -1472,7 +1372,7 @@ class _CompassPainter extends CustomPainter {
         textDirection: TextDirection.ltr,
       )..layout();
       p.paint(canvas, pos - Offset(p.width / 2, p.height / 2));
-    };
+    }
     textPainter('N', 0);
     textPainter('E', 90);
     textPainter('S', 180);

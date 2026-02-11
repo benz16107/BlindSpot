@@ -1,12 +1,24 @@
 # BLINDSPOT
 
-**BLINDSPOT** is a Flutter app for assistive walking navigation: live camera, GPS, **voice agent** (turn-by-turn, “where am I?”, nearby search), **obstacle detection** (haptics + voice), and haptics. Built for blind and low-vision users.
+**BLINDSPOT** is a Flutter app for assistive walking navigation: live camera, GPS, **voice agent** (turn-by-turn, “where am I?”, nearby search), **obstacle detection** (OpenCV, haptics + voice). Built for blind and low-vision users.
 
 ---
 
-## Architecture: how the pieces connect
+## Project structure
 
-All working components and data flow:
+| Path | Purpose |
+|------|---------|
+| `agent.py` | Voice agent (LiveKit worker) |
+| `agent_config.py` | Prompts, LLM/STT/TTS/VAD |
+| `obstacle.py` | Obstacle detection (OpenCV) |
+| `google_maps.py`, `navigation.py` | Navigation |
+| `backboard_store.py` | Memory |
+| `scripts/download_yolov8n_onnx.py` | Export YOLOv8n ONNX |
+| `lib/` | Flutter app |
+
+## Architecture
+
+Data flow:
 
 ```mermaid
 flowchart TB
@@ -17,12 +29,10 @@ flowchart TB
     MIC[Microphone]
     SPEAKER[Speaker]
     HAPTIC[Haptics]
-    TTS[TTS]
-    OBST_LOCAL[Obstacle: Gemini API]
     VOICE_SVC[VoiceService]
   end
 
-  subgraph cloud["☁️ LiveKit (voice + data)"]
+  subgraph cloud["☁️ LiveKit"]
     ROOM[Room]
   end
 
@@ -30,11 +40,12 @@ flowchart TB
     AGENT[agent.py]
   end
 
-  subgraph agent_internals["Agent pipeline"]
+  subgraph agent_internals["Agent"]
     STT[Deepgram STT]
     LLM[Gemini LLM]
     TTS_EL[ElevenLabs TTS]
-    TOOLS[Navigation, Backboard, Zapier]
+    OBST[OpenCV obstacle]
+    TOOLS[Navigation, Backboard]
   end
 
   subgraph apis["External APIs"]
@@ -49,13 +60,14 @@ flowchart TB
   UI --> GPS
   UI --> MIC
   UI --> VOICE_SVC
-
-  CAM -->|frame every 1s| OBST_LOCAL
-  OBST_LOCAL -->|image| GEMINI
-  GEMINI -->|JSON: obstacle, distance| OBST_LOCAL
-  OBST_LOCAL -->|near?| HAPTIC
-  OBST_LOCAL -->|near?| TTS
-  OBST_LOCAL -->|when voice on| VOICE_SVC
+  CAM -->|frames| VOICE_SVC
+  VOICE_SVC -->|obstacle-frame| ROOM
+  ROOM -->|frame| AGENT
+  AGENT --> OBST
+  AGENT -->|obstacle| ROOM
+  ROOM -->|obstacle| VOICE_SVC
+  VOICE_SVC --> HAPTIC
+  VOICE_SVC --> SPEAKER
 
   MIC -->|audio| VOICE_SVC
   VOICE_SVC <-->|WebSocket: audio + data| ROOM
@@ -87,10 +99,9 @@ flowchart TB
 | **LiveKit** | **Phone** | Agent’s voice (TTS audio) |
 | **LiveKit** | **agent.py** | When the app joins a room, LiveKit runs your worker; it joins the same room and gets mic + data |
 | **agent.py** | **LiveKit** | Synthesized speech (ElevenLabs) and any “say” (e.g. turn-by-turn, obstacle phrase) |
-| **Phone** | **Gemini** | Camera frame (if using in-app obstacle detection) → JSON with `obstacle_detected`, `distance`, `description` |
+| **Phone** | **LiveKit** | Camera frame (obstacle mode) → agent |
+| **agent.py** | **OpenCV** | Frames → HOG or YOLOv8n ONNX (no API key) → obstacle result |
 | **agent.py** | **APIs** | Deepgram (STT), Gemini (LLM), ElevenLabs (TTS), Google Maps (navigation), Backboard (memory), optional Zapier |
-
-Optional variant: the app can **POST** camera frames to **your own obstacle server** instead of calling Gemini directly; that server would call Gemini and return the same JSON.
 
 ---
 
@@ -98,7 +109,7 @@ Optional variant: the app can **POST** camera frames to **your own obstacle serv
 
 | Component | Runs on | Role |
 |-----------|---------|------|
-| **BLINDSPOT app** | Phone / simulator | Camera, GPS, LiveKit client (mic + data), in-app obstacle (Gemini), haptics, TTS for obstacles |
+| **BLINDSPOT app** | Phone / simulator | Camera, GPS, LiveKit client (mic + data), obstacle frames to agent, haptics, TTS for obstacles |
 | **LiveKit** | Cloud (or self-hosted) | Real-time voice + data between app and agent |
 | **agent.py** | Your machine (via LiveKit) | Voice assistant: STT → LLM → TTS, navigation tools, obstacle voice alert, memory |
 
@@ -112,11 +123,11 @@ Optional variant: the app can **POST** camera frames to **your own obstacle serv
    - **Config:** `.env.local` (see [CONFIG.md](CONFIG.md)) + **`agent_config.py`** (prompts, model, VAD, greeting).
 
 2. **BLINDSPOT app**  
-   - **Run:** `flutter run` (device or simulator).  
-   - **Config:** **`lib/config.dart`** (API keys, LiveKit, obstacle model/prompt/params).  
-   - **Token:** Either **in-app** (set LiveKit URL + key + secret in `lib/config.dart`) or your own token server URL.
+   - **Run:** `./run_app.sh` (loads keys from `.env.local`; plain `flutter run` does not pass keys).  
+   - **Config:** All keys in **`.env.local`**; **`lib/config.dart`** for obstacle params only.  
+   - **Token:** In-app (LiveKit URL/key/secret come from `.env.local` via `run_app.sh`).
 
-No separate token server or obstacle server is required: the app can generate the LiveKit token itself and run obstacle detection in-app with Gemini.
+No separate token server is required: the app can generate the LiveKit token itself. Obstacle detection runs on the agent using OpenCV (no API key).
 
 ---
 
@@ -137,10 +148,12 @@ No separate token server or obstacle server is required: the app can generate th
    - Run: `./run_agent.sh` or `uv run agent.py dev` (use `console` only for local mic/speaker testing).
 
 2. **App**  
-   - Set LiveKit (and optional `GOOGLE_API_KEY` for in-app obstacle) in `lib/config.dart` or via `--dart-define`.  
-   - Run: `flutter run` (BLINDSPOT).
+   - Same `.env.local` as the agent; `./run_app.sh` passes LiveKit keys to the app. Obstacle uses OpenCV on the agent (no key).  
+   - Run: `./run_app.sh` (see [CONFIG.md](CONFIG.md)).
 
 3. On the phone: enable **voice** (mic) and optionally **obstacle** (camera → haptics + voice). Ask “Where am I?” or “Navigate to [address]” / “Take me to the nearest coffee shop.”
+
+**Object detection not working?** Run `./run_agent.sh` in a **separate terminal**. The agent registers with LiveKit and processes camera frames when the phone connects. Without it, frames are sent but never analyzed.
 
 ---
 

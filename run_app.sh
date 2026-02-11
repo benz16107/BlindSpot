@@ -1,27 +1,39 @@
 #!/bin/bash
-# Run Flutter app with keys from .env.local (same file used by agent.py).
-# Fixes: connection refused (use in-app LiveKit token, not localhost) and GOOGLE_API_KEY for obstacles.
+# Run the Flutter phone app with API keys from .env.local.
+#
+# Uses --dart-define-from-file (same as run_flutter.sh) so keys are passed
+# exactly as in .env.local, avoiding shell-escaping issues.
 #
 # Usage: ./run_app.sh [flutter run args...]
-# Example: ./run_app.sh --no-sound-null-safety
 #
-# Requires: .env.local with LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET, GOOGLE_API_KEY
+# For voice to work you also need the agent: ./run_agent.sh (in another terminal).
 
 set -e
 cd "$(dirname "$0")"
 
-# Load .env.local (strip comments and empty lines, export vars)
-if [ -f .env.local ]; then
-  set -a
-  # shellcheck disable=SC1091
-  source <(grep -v '^#' .env.local | grep -v '^$' | sed 's/^/export /')
-  set +a
+if [ ! -f .env.local ]; then
+  echo "No .env.local found. Copy .env.local.template to .env.local and add LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET."
+  echo "Then run ./run_app.sh again."
+  exit 1
 fi
 
-# Pass keys to Flutter. Use empty string if not set (app will show setup prompts).
-flutter run \
-  --dart-define=GOOGLE_API_KEY="${GOOGLE_API_KEY:-}" \
-  --dart-define=LIVEKIT_URL="${LIVEKIT_URL:-}" \
-  --dart-define=LIVEKIT_API_KEY="${LIVEKIT_API_KEY:-}" \
-  --dart-define=LIVEKIT_API_SECRET="${LIVEKIT_API_SECRET:-}" \
-  "$@"
+# Build dart_defines.json from .env.local (same format/mechanism as run_flutter.sh)
+DART_DEFINES=$(mktemp)
+trap 'rm -f "$DART_DEFINES"' EXIT
+python3 -c "
+import json, re
+vars = {}
+with open('.env.local') as f:
+    for line in f:
+        line = line.strip()
+        if line and not line.startswith('#'):
+            m = re.match(r'^([A-Za-z_][A-Za-z0-9_]*)=(.*)$', line)
+            if m:
+                k, v = m.group(1), m.group(2).strip()
+                if k in ('GOOGLE_API_KEY', 'LIVEKIT_URL', 'LIVEKIT_API_KEY', 'LIVEKIT_API_SECRET', 'TOKEN_URL'):
+                    v = v.strip('\"').strip(\"'\")
+                    vars[k] = v
+print(json.dumps(vars))
+" > "$DART_DEFINES"
+
+flutter run --dart-define-from-file="$DART_DEFINES" "$@"

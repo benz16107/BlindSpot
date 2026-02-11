@@ -1,12 +1,6 @@
 """
-Backboard Memory Manager - Handles persistent memory across sessions
-
-This module manages:
-- Single assistant creation (reused across all sessions)
-- Thread reuse (same thread_id = continuous memory)
-- Message history (stored on Backboard, accessed on session start)
-- Tool execution tracking (as messages in thread)
-- Local metadata (only thread_id and assistant_id cached)
+Backboard Memory Manager - Handles persistent memory across sessions.
+Optimized to minimize API credits: reduced history, no tool persistence, thread rotation.
 """
 
 import json
@@ -17,6 +11,9 @@ from typing import Optional, Dict, List, Any
 from backboard import BackboardClient
 
 logger = logging.getLogger("backboard")
+
+# Rotate to new thread when message count exceeds this (prevents unbounded growth)
+THREAD_ROTATION_LIMIT = 80
 
 
 class BackboardMemoryManager:
@@ -111,15 +108,10 @@ context-aware responses. Be concise since this is voice interaction."""
             logger.error(f"Failed to initialize Backboard: {e}")
             raise
 
-    async def load_thread_history(self, limit: int = 50) -> List[Dict[str, Any]]:
+    async def load_thread_history(self, limit: int = 15) -> List[Dict[str, Any]]:
         """
-        Load full conversation history from Backboard thread
-        
-        Args:
-            limit: Maximum number of recent messages to load (increased to 50 for better recall)
-            
-        Returns:
-            List of messages with role, content, created_at
+        Load conversation history from Backboard thread.
+        Rotates to a new thread when message count exceeds THREAD_ROTATION_LIMIT.
         """
         if not self.thread_id:
             logger.warning("No thread_id set, returning empty history")
@@ -127,7 +119,18 @@ context-aware responses. Be concise since this is voice interaction."""
         
         try:
             thread = await self.client.get_thread(self.thread_id)
-            logger.debug(f"Loaded thread with {len(thread.messages)} messages")
+            msg_count = len(thread.messages)
+            logger.debug(f"Loaded thread with {msg_count} messages")
+            
+            # Rotate to new thread if too large (reduces future get_thread payload size)
+            if msg_count > THREAD_ROTATION_LIMIT:
+                logger.info(f"Thread has {msg_count} messages, rotating to new thread")
+                new_thread = await self.client.create_thread(self.assistant_id)
+                self.thread_id = str(new_thread.thread_id)
+                self.conversation_history["thread_id"] = self.thread_id
+                self.conversation_history["created"] = datetime.now().isoformat()
+                self._save_memory()
+                return []
             
             # Convert to dicts, keep only recent messages
             message_list = []
@@ -144,16 +147,15 @@ context-aware responses. Be concise since this is voice interaction."""
             logger.error(f"Failed to load thread history: {e}")
             return []
 
-    def format_context_for_llm(self, messages: List[Dict[str, Any]], max_chars: int = 8000) -> str:
+    def format_context_for_llm(self, messages: List[Dict[str, Any]], max_chars: int = 4000) -> str:
         """
         Format message history as context for LLM injection
         
-        Converts thread messages into a concise context string that can be injected
-        into Realtime model instructions.
+        Converts thread messages into a concise context string for LLM injection.
         
         Args:
             messages: List of messages from load_thread_history()
-            max_chars: Maximum characters to include (8000 for rich memory recall)
+            max_chars: Maximum characters to include (lower = fewer tokens)
             
         Returns:
             Formatted context string ready for injection
@@ -235,46 +237,8 @@ context-aware responses. Be concise since this is voice interaction."""
             logger.error(f"Failed to save assistant message: {e}")
 
     async def add_tool_message(self, tool_execution: Dict[str, Any]):
-        """
-        Save tool execution result to Backboard thread as a message
-        
-        Tool executions are stored as structured messages in the thread,
-        making them part of the conversation history that the LLM can see.
-        
-        Args:
-            tool_execution: Dict with:
-                - tool_name: str
-                - status: "SUCCESS" | "ERROR" | "TIMEOUT" | "CANCELLED"
-                - args: sanitized tool arguments
-                - result: tool output or error message
-                - timestamp: ISO timestamp
-        """
-        if not self.thread_id:
-            logger.warning("No thread_id set, cannot save tool message")
-            return
-        
-        try:
-            # Format as message content
-            message_content = json.dumps({
-                "type": "tool_execution",
-                "tool_name": tool_execution.get("tool_name"),
-                "status": tool_execution.get("status"),
-                "args": tool_execution.get("args"),
-                "result": tool_execution.get("result", ""),
-                "timestamp": tool_execution.get("timestamp")
-            })
-            
-            await self.client.add_message(
-                thread_id=self.thread_id,
-                content=message_content,
-                llm_provider=None
-            )
-            logger.info(
-                f"Tool execution saved: {tool_execution.get('tool_name')} "
-                f"status={tool_execution.get('status')}"
-            )
-        except Exception as e:
-            logger.error(f"Failed to save tool message: {e}")
+        """No-op: tool messages are not persisted to reduce Backboard credits."""
+        pass
 
     async def get_thread_summary(self) -> str:
         """
@@ -293,22 +257,19 @@ context-aware responses. Be concise since this is voice interaction."""
             return "Unable to retrieve summary"
 
 
-async def init_backboard() -> BackboardMemoryManager:
+async def init_backboard() -> Optional[BackboardMemoryManager]:
     """
-    Initialize and return Backboard memory manager
-    
-    This is the entry point for agent.py
-    
-    Returns:
-        Initialized BackboardMemoryManager ready to use
+    Initialize and return Backboard memory manager.
+    Returns None if BACKBOARD_API_KEY is not set (memory disabled, no credits used).
     """
     from dotenv import load_dotenv
     
     load_dotenv(".env.local")
-    api_key = os.getenv("BACKBOARD_API_KEY")
+    api_key = (os.getenv("BACKBOARD_API_KEY") or "").strip()
     
     if not api_key:
-        raise ValueError("BACKBOARD_API_KEY not set in .env.local")
+        logger.info("BACKBOARD_API_KEY not set; memory disabled (no Backboard credits used)")
+        return None
     
     manager = BackboardMemoryManager(api_key=api_key)
     await manager.initialize()

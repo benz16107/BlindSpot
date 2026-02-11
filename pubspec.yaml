@@ -14,7 +14,6 @@ dependencies:
   flutter_compass: ^0.8.1
   http: ^1.2.0
   livekit_client: ^2.0.0
-  google_generative_ai: ^0.4.7
   dart_jsonwebtoken: ^3.3.1
 
   # Camera access (Android + iOS)
