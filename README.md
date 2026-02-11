@@ -21,7 +21,7 @@
 
 - **Flutter** (for the app)
 - **Python 3.10+** with **uv** (`pip install uv` or see [uv docs](https://github.com/astral-sh/uv))
-- **Accounts:** [LiveKit Cloud](https://cloud.livekit.io/) (free tier), [Google AI](https://aistudio.google.com/) (Gemini), [Deepgram](https://deepgram.com/), [ElevenLabs](https://elevenlabs.io/), [Google Maps](https://console.cloud.google.com/) (Directions + Places APIs)
+- **Accounts:** [LiveKit Cloud](https://cloud.livekit.io/) (free tier), [Google AI](https://aistudio.google.com/) (Gemini), [ElevenLabs](https://elevenlabs.io/) (STT + TTS), [Google Maps](https://console.cloud.google.com/) (Directions + Places APIs)
 
 ---
 
@@ -86,9 +86,13 @@
 | **Phone** | **LiveKit** | Microphone audio, GPS (topic `gps`), camera frames (topic `obstacle-frame`) |
 | **Agent** | **LiveKit** | Synthesized speech (TTS), obstacle results (topic `obstacle`) |
 | **LiveKit** | **Phone** | Agent’s voice, obstacle alerts (haptics + optional voice) |
-| **Agent** | **APIs** | Deepgram (STT), Gemini (LLM), ElevenLabs (TTS), Google Maps (navigation) |
+| **Agent** | **APIs** | ElevenLabs (STT + TTS), Gemini (LLM), Google Maps (navigation) |
 
-No token server needed: the app generates the LiveKit token in-app using keys from `.env.local`.
+**Voice pipeline:** User speaks → ElevenLabs STT → Gemini LLM → ElevenLabs TTS → Speaker
+
+**Obstacle pipeline:** Camera frame → Agent (OpenCV) → Haptics + voice alert
+
+No token server — app generates LiveKit token in-app.
 
 ---
 
@@ -96,7 +100,7 @@ No token server needed: the app generates the LiveKit token in-app using keys fr
 
 | What | Where |
 |------|------|
-| **API keys** (LiveKit, Google, Deepgram, ElevenLabs, etc.) | [CONFIG.md](CONFIG.md) |
+| **API keys** (LiveKit, Google, ElevenLabs, etc.) | [CONFIG.md](CONFIG.md) |
 | **Voice agent** (instructions, models, VAD, greeting) | `agent_config.py` |
 | **Object detection** (interval, image size, sensitivity) | `lib/config.dart` |
 | **Obstacle model** (HOG vs YOLOv8n, classes) | `obstacle.py` |

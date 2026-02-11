@@ -14,8 +14,7 @@ Single place to see **where every API key and major setting lives**, and where t
 | **LIVEKIT_API_SECRET** | App (voice) | **`.env.local`** — `run_app.sh` passes to app |
 | **TOKEN_URL**        | App (voice)    | `lib/config.dart` — only if not using in-app LiveKit token |
 | **GOOGLE_MAPS_API_KEY** | Agent (navigation) | `.env.local` only |
-| **DEEPGRAM_API_KEY** | Agent (STT)    | `.env.local` only |
-| **ELEVEN_API_KEY**   | Agent (TTS)   | `.env.local` only |
+| **ELEVEN_API_KEY**   | Agent (STT + TTS) | `.env.local` only |
 | **ELEVEN_VOICE_ID**  | Agent (TTS)   | `.env.local` (optional; default in `agent_config.py`) |
 | **ELEVEN_MODEL**     | Agent (TTS)   | `.env.local` (optional; default in `agent_config.py`) |
 | **BACKBOARD_API_KEY**| Agent (memory, optional)| `.env.local` — omit to disable memory (no credits) |
@@ -30,7 +29,7 @@ Single place to see **where every API key and major setting lives**, and where t
 
 | What | File | What you can change |
 |------|------|----------------------|
-| **Voice agent** (model, prompts, VAD, TTS, greeting) | **`agent_config.py`** | `AGENT_BASE_INSTRUCTIONS`, `LLM_MODEL`, `THINKING_BUDGET`, `STT_MODEL`, `STT_LANGUAGE`, `VAD_*`, `TTS_*`, `MEMORY_HISTORY_LIMIT`, `GREETING_*`, `OBSTACLE_PHRASE_TEMPLATE` |
+| **Voice agent** (model, prompts, VAD, STT, TTS, greeting) | **`agent_config.py`** | `AGENT_BASE_INSTRUCTIONS`, `LLM_MODEL`, `THINKING_BUDGET`, `STT_MODEL`, `STT_LANGUAGE`, `VAD_*`, `TTS_*`, `MEMORY_HISTORY_LIMIT`, `GREETING_*`, `OBSTACLE_PHRASE_TEMPLATE` |
 | **Obstacle detection** (agent: frames → OpenCV HOG or YOLOv8n ONNX) | **`obstacle.py`** | `CENTER_*_FRAC`, `OBSTACLE_CLASS_IDS`; optional `yolov8n.onnx` in project root |
 | **Obstacle frame capture** (app) | **`lib/config.dart`** | `obstacleCheckIntervalMs`, `obstacleImageMaxWidth`, `obstacleJpegQuality`, `obstacleHapticPeriodMs` |
 
@@ -48,8 +47,7 @@ Single place to see **where every API key and major setting lives**, and where t
 | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | Voice: app + agent |
 | `GOOGLE_API_KEY` | Gemini LLM (agent); also passed to app by `run_app.sh` |
 | `GOOGLE_MAPS_API_KEY` | Navigation (agent) |
-| `DEEPGRAM_API_KEY` | Speech-to-text (agent) |
-| `ELEVEN_API_KEY`, `ELEVEN_VOICE_ID`, `ELEVEN_MODEL` | Text-to-speech (agent); voice/model optional |
+| `ELEVEN_API_KEY`, `ELEVEN_VOICE_ID`, `ELEVEN_MODEL` | Speech-to-text & text-to-speech (agent); voice/model optional |
 | `BACKBOARD_API_KEY` | Memory (agent); optional |
 
 **Do not commit `.env.local`** — it is in `.gitignore`.
