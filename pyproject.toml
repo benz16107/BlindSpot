@@ -12,8 +12,17 @@ dependencies = [
     "livekit-plugins-google<1.4",
     "googlemaps>=4.10.0",
     "pillow>=10.0.0",
-    "opencv-python>=4.8.0",
+    "opencv-python>=4.8.0,<5",  # 5.0 drops cv2.HOGDescriptor; obstacle.py person detector needs it
     "ultralytics>=8.4.14",
     "onnx>=1.20.1",
     "onnxslim>=0.1.84",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

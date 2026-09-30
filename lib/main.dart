@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
-import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:camera/camera.dart';
@@ -152,10 +151,12 @@ class SplashScreen extends StatefulWidget {
 }
 
 class _SplashScreenState extends State<SplashScreen> {
+  Timer? _timer;
+
   @override
   void initState() {
     super.initState();
-    Future.delayed(const Duration(seconds: 3), () {
+    _timer = Timer(const Duration(seconds: 3), () {
       if (!mounted) return;
       Navigator.of(context).pushReplacement(
         MaterialPageRoute(
@@ -163,6 +164,12 @@ class _SplashScreenState extends State<SplashScreen> {
         ),
       );
     });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
   }
 
   @override
@@ -490,7 +497,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
 
       // 3) One-shot position first (fast handoff to routing)
       final first = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.high,
+        locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
       );
 
       if (!mounted) return;
@@ -755,8 +762,10 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
   }
 
   void _announceToScreenReader(String message) {
+    final view = mounted ? View.maybeOf(context) : null;
+    if (view == null) return;
     try {
-      SemanticsService.announce(message, TextDirection.ltr);
+      SemanticsService.sendAnnouncement(view, message, TextDirection.ltr);
     } catch (_) {
       // Announce not supported on this platform
     }
@@ -908,7 +917,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                         padding: const EdgeInsets.symmetric(
                             horizontal: 20, vertical: 16),
                         decoration: BoxDecoration(
-                          color: Colors.orange.shade700.withOpacity(0.95),
+                          color: Colors.orange.shade700.withValues(alpha: 0.95),
                           borderRadius: BorderRadius.circular(16),
                           border: Border.all(color: Colors.white, width: 2),
                         ),
@@ -955,7 +964,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                               const SizedBox(height: 16),
                               Text(_status,
                                   style: TextStyle(
-                                      color: Colors.white.withOpacity(0.8),
+                                      color: Colors.white.withValues(alpha: 0.8),
                                       fontSize: 16)),
                             ],
                           ),
@@ -974,14 +983,14 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                       padding: const EdgeInsets.symmetric(
                           horizontal: 16, vertical: 14),
                       decoration: BoxDecoration(
-                        color: Colors.black.withOpacity(0.68),
+                        color: Colors.black.withValues(alpha: 0.68),
                         borderRadius: BorderRadius.circular(20),
                         border: Border.all(
                           color: _obstacleInFront
                               ? (_obstacleBorderFlashOn
                                   ? Colors.orange
-                                  : Colors.orange.withOpacity(0.5))
-                              : Colors.white.withOpacity(0.4),
+                                  : Colors.orange.withValues(alpha: 0.5))
+                              : Colors.white.withValues(alpha: 0.4),
                           width: _obstacleInFront ? 2 : 1,
                         ),
                       ),
@@ -1009,7 +1018,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                     Text(
                                       _locationLine(),
                                       style: TextStyle(
-                                        color: Colors.white.withOpacity(0.9),
+                                        color: Colors.white.withValues(alpha: 0.9),
                                         fontSize: 14,
                                         fontWeight: FontWeight.w400,
                                       ),
@@ -1043,7 +1052,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                       ? 'Connected'
                                       : 'Tap Navigation or Obstacles to start',
                               style: TextStyle(
-                                color: Colors.white.withOpacity(0.9),
+                                color: Colors.white.withValues(alpha: 0.9),
                                 fontSize: 14,
                                 fontWeight: FontWeight.w500,
                               ),
@@ -1057,7 +1066,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                 style: TextStyle(
                                   color: _obstacleInFront
                                       ? Colors.orange
-                                      : Colors.white.withOpacity(0.9),
+                                      : Colors.white.withValues(alpha: 0.9),
                                   fontSize: 14,
                                   fontWeight: FontWeight.w500,
                                 ),
@@ -1076,7 +1085,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                       child: LinearProgressIndicator(
                                         value: _micLevel ?? 0,
                                         backgroundColor:
-                                            Colors.white.withOpacity(0.25),
+                                            Colors.white.withValues(alpha: 0.25),
                                         valueColor:
                                             const AlwaysStoppedAnimation<Color>(
                                                 Color(0xFF34C759)),
@@ -1087,7 +1096,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                   Text(
                                     'Mic: ${((_micLevel ?? 0) * 100).toStringAsFixed(0)}%',
                                     style: TextStyle(
-                                        color: Colors.white.withOpacity(0.9),
+                                        color: Colors.white.withValues(alpha: 0.9),
                                         fontSize: 13),
                                   ),
                                   const Spacer(),
@@ -1102,7 +1111,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                         padding: const EdgeInsets.symmetric(
                                             horizontal: 14, vertical: 10),
                                         decoration: BoxDecoration(
-                                          color: Colors.white.withOpacity(0.25),
+                                          color: Colors.white.withValues(alpha: 0.25),
                                           borderRadius:
                                               BorderRadius.circular(12),
                                         ),
@@ -1120,7 +1129,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                               Text(
                                 'Listening… speak to test (stops in 15s or tap Stop)',
                                 style: TextStyle(
-                                    color: Colors.white.withOpacity(0.7),
+                                    color: Colors.white.withValues(alpha: 0.7),
                                     fontSize: 12),
                               ),
                             ] else if (!_voiceService.isConnected &&
@@ -1137,10 +1146,10 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                     padding: const EdgeInsets.symmetric(
                                         horizontal: 16, vertical: 12),
                                     decoration: BoxDecoration(
-                                      color: Colors.white.withOpacity(0.2),
+                                      color: Colors.white.withValues(alpha: 0.2),
                                       borderRadius: BorderRadius.circular(12),
                                       border: Border.all(
-                                          color: Colors.white.withOpacity(0.3)),
+                                          color: Colors.white.withValues(alpha: 0.3)),
                                     ),
                                     child: const Row(
                                       mainAxisSize: MainAxisSize.min,
@@ -1170,7 +1179,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                       boxShadow: [
                                         BoxShadow(
                                             color: const Color(0xFF34C759)
-                                                .withOpacity(0.6),
+                                                .withValues(alpha: 0.6),
                                             blurRadius: 6)
                                       ],
                                     ),
@@ -1179,7 +1188,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                   Text(
                                     'Mic live (sending to agent)',
                                     style: TextStyle(
-                                        color: Colors.white.withOpacity(0.9),
+                                        color: Colors.white.withValues(alpha: 0.9),
                                         fontSize: 13,
                                         fontWeight: FontWeight.w500),
                                   ),
@@ -1193,7 +1202,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                               Text(
                                 'Chrome: allow mic when prompted. After connecting, tap "Tap to enable speaker" if you can\'t hear.',
                                 style: TextStyle(
-                                    color: Colors.white.withOpacity(0.7),
+                                    color: Colors.white.withValues(alpha: 0.7),
                                     fontSize: 12),
                               ),
                             ],
@@ -1204,7 +1213,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                 Text(
                                   'Chrome: allow microphone when prompted. If you can\'t hear the agent, tap below.',
                                   style: TextStyle(
-                                      color: Colors.white.withOpacity(0.9),
+                                      color: Colors.white.withValues(alpha: 0.9),
                                       fontSize: 13),
                                 ),
                               ],
@@ -1226,10 +1235,10 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                         horizontal: 16, vertical: 14),
                                     decoration: BoxDecoration(
                                       color: Colors.orange.shade400
-                                          .withOpacity(0.9),
+                                          .withValues(alpha: 0.9),
                                       borderRadius: BorderRadius.circular(12),
                                       border: Border.all(
-                                          color: Colors.white.withOpacity(0.2)),
+                                          color: Colors.white.withValues(alpha: 0.2)),
                                     ),
                                     child: Center(
                                       child: Text(
@@ -1266,13 +1275,13 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                         padding: const EdgeInsets.symmetric(
                             horizontal: 10, vertical: 10),
                         decoration: BoxDecoration(
-                          color: Colors.black.withOpacity(0.55),
+                          color: Colors.black.withValues(alpha: 0.55),
                           borderRadius: BorderRadius.circular(32),
                           border: Border.all(
-                              color: Colors.white.withOpacity(0.45), width: 1),
+                              color: Colors.white.withValues(alpha: 0.45), width: 1),
                           boxShadow: [
                             BoxShadow(
-                              color: Colors.black.withOpacity(0.35),
+                              color: Colors.black.withValues(alpha: 0.35),
                               blurRadius: 20,
                               offset: const Offset(0, 8),
                             ),
@@ -1296,7 +1305,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                 enabled: !_voiceConnecting,
                                 child: Material(
                                   color: _navigationOn && !_voiceConnecting
-                                      ? const Color(0xFF34C759).withOpacity(0.5)
+                                      ? const Color(0xFF34C759).withValues(alpha: 0.5)
                                       : Colors.transparent,
                                   borderRadius: BorderRadius.circular(26),
                                   child: InkWell(
@@ -1329,7 +1338,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                                   color: _navigationOn
                                                       ? Colors.white
                                                       : Colors.white
-                                                          .withOpacity(0.9),
+                                                          .withValues(alpha: 0.9),
                                                 ),
                                                 const SizedBox(width: 8),
                                                 Flexible(
@@ -1344,7 +1353,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                                       color: _navigationOn
                                                           ? Colors.white
                                                           : Colors.white
-                                                              .withOpacity(0.9),
+                                                              .withValues(alpha: 0.9),
                                                     ),
                                                   ),
                                                 ),
@@ -1367,7 +1376,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                   button: true,
                                   child: Material(
                                     color: _obstacleDetectionOn
-                                        ? Colors.orange.withOpacity(0.5)
+                                        ? Colors.orange.withValues(alpha: 0.5)
                                         : Colors.transparent,
                                     borderRadius: BorderRadius.circular(26),
                                     child: InkWell(
@@ -1388,7 +1397,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                               color: _obstacleDetectionOn
                                                   ? Colors.white
                                                   : Colors.white
-                                                      .withOpacity(0.9),
+                                                      .withValues(alpha: 0.9),
                                             ),
                                             const SizedBox(width: 8),
                                             Flexible(
@@ -1401,7 +1410,7 @@ class _CameraPreviewScreenState extends State<CameraPreviewScreen> {
                                                   color: _obstacleDetectionOn
                                                       ? Colors.white
                                                       : Colors.white
-                                                          .withOpacity(0.9),
+                                                          .withValues(alpha: 0.9),
                                                 ),
                                               ),
                                             ),
@@ -1490,12 +1499,12 @@ class _CompassWidget extends StatelessWidget {
           height: size,
           decoration: BoxDecoration(
             shape: BoxShape.circle,
-            color: Colors.white.withOpacity(0.2),
+            color: Colors.white.withValues(alpha: 0.2),
             border:
-                Border.all(color: Colors.white.withOpacity(0.4), width: 1.5),
+                Border.all(color: Colors.white.withValues(alpha: 0.4), width: 1.5),
             boxShadow: [
               BoxShadow(
-                color: Colors.black.withOpacity(0.25),
+                color: Colors.black.withValues(alpha: 0.25),
                 blurRadius: 12,
                 offset: const Offset(0, 4),
               ),

@@ -56,3 +56,5 @@ app.*.map.json
 /android/app/release
 build/
 __pycache__/
+.venv/
+.pytest_cache/
